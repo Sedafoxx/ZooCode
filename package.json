@@ -7,6 +7,7 @@
   "scripts": {
     "scaffold": "tsx scripts/scaffold.ts",
     "analyze": "tsx scripts/analyze.ts",
+    "search": "tsx scripts/search.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "oxlint"
