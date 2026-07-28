@@ -51,4 +51,12 @@ Every project we build together will be:
 - **Tested** so we can refactor fearlessly
 - **Committed** to git so we have a clean history
 
+## Debugging Tools
+
+I now have these tools to see what you see:
+- `/api/debug?auth=zoo-debug-key` — app state dump (events, memories, stats)
+- `/api/log-error` — client-side error logging
+- Playwright MCP — take screenshots of the live site
+- Terminal 2 — long-running builds visible in real-time
+
 Let's build something awesome.
