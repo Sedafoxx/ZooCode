@@ -334,6 +334,9 @@ around [`runAgent()`](lib/harness.ts:103):
 | **Bounded work** | `maxSteps` (default 25, `--max-steps`) bounds the loop. Exhausting it still produces a full report. |
 | **Mandatory verify gate** | After the agent stops, the gate command (`npm run verify`, override with `--verify-cmd`) runs in the repo. A **red gate forces `ok: false` even if the agent reported success** — success is never claimed without a green gate. |
 | **No unreviewed commits** | `commit` defaults to `false`. `--commit` stages everything and commits with a conventional `chore(improve): <goal>` message after a green verify; otherwise the changes stay on the branch, unstaged, for human review. |
+| **Action-forcing prompt** | The system prompt ([`defaultImproveSystemPrompt()`](lib/improve.ts)) states that the deliverable is a written change, forbids plans/analyses/summaries, forbids surveying the repo, and requires the target file to be written or edited **within the first three tool calls**, with the gate run only afterwards and `finish` called as soon as the goal is met. |
+| **Step-budget steering** | [`createSteeringLlmClient()`](lib/improve.ts) wraps the `LlmClient` and counts steps: at **60%** of the budget it appends one "stop exploring, WRITE the change now" reminder to the OUTBOUND request, and at **85%** a harder "only N steps left, write immediately then `finish`" one. Each tier fires at most once, at most one message per step, and the loop's transcript is never mutated. `ImproveReport.steeringInjected` records how many landed. |
+| **Partial-progress artifacts** | When the agent stops — success OR failure — the run's full diff (**including untracked files**) and the serialized report are written to `<repo>/.zoo/improve/<runId>/` as `changed.patch` / `report.json`. The write is wrapped (a failure only adds a note) and cannot dirty the tree: `.zoo/improve/` is gitignored, and the loop also adds it to the target repo's `.git/info/exclude`. |
 
 Two more rules live in the CLI: `improve` requires a **real API key** (there is no
 `--mock` fallback — a fake improvement would be worse than a failure), and it
@@ -344,13 +347,21 @@ with `ok: false` and `error`, and `--json` prints that report verbatim.
 
 ```
 goal · branch · preflight { isGitRepo, clean, notes } · agent { steps, final } ·
-changedFiles · diffStat · verify { command, exitCode, tail } · committed · error
+changedFiles · diffStat · verify { command, exitCode, tail } · committed ·
+steeringInjected · artifactsDir · error
 ```
 
 The human output shows the branch, the preflight result, the changed files, a
 diff stat, the verify command and its result (with a tail of the output when it
 fails), and — prominently — that **nothing was committed and the work sits on the
 branch awaiting review**.
+
+Even a run that exhausts its step budget leaves reviewable work: the directory
+named in `artifactsDir` holds `changed.patch` (the full diff of whatever the
+agent changed, untracked files included) and `report.json` (the serialized
+report). The artifacts are written on **every** post-agent path — success or
+failure — and `.zoo/improve/` is gitignored, so they never dirty the tree or the
+next run's clean-tree preflight.
 
 Review it like any other branch:
 
@@ -378,7 +389,7 @@ npm run verify     # oxlint && tsc --noEmit && vitest run
   [`lib/doctor.ts`](lib/doctor.ts:38), which is intentional ANSI stripping).
 - `tsc --noEmit` — 0 errors under `strict`, `noUnusedLocals`,
   `noUnusedParameters`, `verbatimModuleSyntax`, `erasableSyntaxOnly`.
-- `vitest run` — 282 passing tests (283 collected across 19 files; the 1-test
+- `vitest run` — 292 passing tests (293 collected across 19 files; the 1-test
   live-network suite in [`tests/live.test.ts`](tests/live.test.ts) is skipped
   when no API key is present, so 18 of the files report passes): every lib layer
   — including the context pruner in
@@ -404,6 +415,6 @@ ZooCode/
 ├── scripts/      standalone utilities (scaffold, analyze, search, commit, doctor)
 ├── tests/        vitest suites for every layer
 ├── docs/         architecture notes
-├── .zoo/         persistent context (state.json) + local usage ledger
+├── .zoo/         persistent context (state.json) + local usage ledger + improve artifacts (gitignored)
 └── PLAN.md       build plan, layer map, and definition-of-done evidence
 ```

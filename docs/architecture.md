@@ -358,9 +358,11 @@ finished, **and** the mandatory gate was green.
 | 1 | `isGitRepo(cwd)` + `getStatus(cwd)` (both from [`lib/git.ts`](../lib/git.ts)) | **Preflight** — not a repo, or a dirty tree, is refused before any write. `dryRun` returns here with the plan. |
 | 2 | `git checkout -b zoo/improve-<timestamp>` | **Branch isolation** — the agent never works on the user's branch; a failure to create the branch aborts the run. |
 | 3 | `guardTools(createCoreTools({ policy: allowlist }), root)` then `runAgent` | **Repo-scoped write guard**, **command guard**, **bounded steps** (`maxSteps`, default 25). |
-| 4 | `collectDiff`: `git add -A` → `diff --cached --stat` → `git reset -q` | Reports the changed files + diff stat; the index is restored so the work stays unstaged for review. |
-| 5 | `verifyRepo(cwd, 'npm run verify')` | **Mandatory verify gate** — a red gate forces `ok: false` even after an agent success. |
+| 3b | `createSteeringLlmClient(llm, { maxSteps })` wraps the client | **Step-budget steering** — appends a `user` reminder to the OUTBOUND request at 60% (nudge) and 85% (warn) of the budget; each tier at most once, at most one per step, and the request is copied so the loop's transcript is never mutated. |
+| 4 | `capturePatch` (right after the agent) | **Partial-progress snapshot** — `git add -A` → `git diff --cached` → `git reset -q` captures the run's full diff (untracked files included) and leaves the tree unstaged/unchanged. |
+| 5 | `collectDiff` / `verifyRepo(cwd, 'npm run verify')` | Reports the changed files + diff stat, then the **mandatory verify gate** — a red gate forces `ok: false` even after an agent success. |
 | 6 | `stageAll` + `commit`, only when `commit: true` | **No unreviewed commits** — the default leaves the change on the branch, uncommitted. |
+| 7 | `writeArtifacts` (always, in a `finally`) | **Partial-progress artifacts** — writes `changed.patch` + `report.json` to `<root>/.zoo/improve/<runId>/` on EVERY post-agent path, success or failure. A failed write only adds a note. |
 
 `guardTools(tools, root)` returns a copy of the tool list in which:
 
@@ -377,6 +379,37 @@ finished, **and** the mandatory gate was green.
 Containment is decided **lexically** (`path.resolve` normalizes `.`/`..` and
 absolute segments); symlinks are deliberately not resolved. This is a
 belt-and-braces layer on top of branch isolation, not a sandbox.
+
+Two behavioural guards sit around the loop, because over-deliberation — not
+context size — was the observed failure mode:
+
+- `defaultImproveSystemPrompt(goal)` states that the deliverable is a **written
+  change, not a plan**: no plans/analyses/summaries, no repository surveys, write
+  or edit the target file **within the first three tool calls**, prefer editing an
+  existing file, run the test/typecheck commands only *after* the change, and call
+  `finish` as soon as the goal is met.
+- `createSteeringLlmClient(inner, { maxSteps, nudgeAt, warnAt })` counts
+  `chat()` calls and appends **one** `role: 'user'` reminder to the outbound
+  request at 60% of the budget (nudge: "stop exploring, write now") and another
+  at 85% (warn: "only N steps remaining, write immediately then `finish`"). Each
+  tier fires at most once (the highest tier already injected is remembered), at
+  most one message is added per step, and the wrapper is **inert** when
+  `maxSteps` is missing/`<= 0`. Crucially it builds
+  `{ ...req, messages: [...req.messages, reminder] }`: `applyContextBudget` hands
+  the loop's own live transcript array to the request when nothing needs pruning,
+  so mutating `req.messages` would corrupt the loop's history and leak into
+  `RunAgentResult.messages`. `ImproveReport.steeringInjected` records the count.
+
+After the agent stops — success **or** failure — `runImprovement` archives the
+run under `<root>/.zoo/improve/<runId>/`: `changed.patch` (the full diff of the
+working tree, untracked files included, captured before the gate and the opt-in
+commit so it survives either) and `report.json` (the serialized `ImproveReport`,
+which carries its own `artifactsDir`). The write runs in a `finally`, is wrapped
+so a failure only appends a preflight note, and cannot dirty the tree:
+`.zoo/improve/` is listed in the repository's `.gitignore` and the loop also
+appends it to the target repo's `.git/info/exclude` — an ignore mechanism git
+does not report — so `git status --porcelain` stays clean and the next run's
+clean-tree preflight still starts. The tree is left **unstaged and unchanged**.
 
 `verifyRepo(cwd, command)` **intentionally shells out** (the reason is in the
 source): the gate must be the same command a human runs, not a reimplementation
@@ -404,7 +437,7 @@ npm run verify     # oxlint && tsc --noEmit && vitest run
 `erasableSyntaxOnly` are all on, so the type signature of every seam is enforced
 at the gate.
 
-`vitest run` covers **282 passing tests** (283 collected across 19 files; the
+`vitest run` covers **292 passing tests** (293 collected across 19 files; the
 1-test live-network suite in [`tests/live.test.ts`](../tests/live.test.ts) is
 skipped unless an API key is present, leaving 18 files that report passes):
 every lib module — including the context pruner in

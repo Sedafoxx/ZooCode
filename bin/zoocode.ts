@@ -1142,12 +1142,17 @@ function cmdUsage(args: string[]): number {
  *  - `--commit` is opt-in, so the default outcome is a branch a human reviews.
  */
 async function cmdImprove(args: string[]): Promise<number> {
-  const parsed = parseArgs(args, ['--max-steps', '--verify-cmd'])
+  const parsed = parseArgs(args, [
+    '--max-steps',
+    '--verify-cmd',
+    '--context-budget',
+    '--keep-recent',
+  ])
   const goal = parsed.positionals[0]
   if (goal === undefined) {
     logger.error('improve requires a goal prompt')
     logger.dim(
-      `usage: zoocode improve "<goal>" [--max-steps N] [--verify-cmd "<cmd>"] [--commit] [--dry-run] [--no-branch] [--json]`,
+      `usage: zoocode improve "<goal>" [--max-steps N] [--verify-cmd "<cmd>"] [--context-budget <tokens>] [--keep-recent <n>] [--commit] [--dry-run] [--no-branch] [--json]`,
     )
     return 1
   }
@@ -1167,6 +1172,9 @@ async function cmdImprove(args: string[]): Promise<number> {
   const config = loaded.data
 
   const maxSteps = flagNumber(parsed, '--max-steps') ?? config.maxSteps
+  // Without this, `--context-budget` / `ZOO_CONTEXT_BUDGET_TOKENS` were silently
+  // ignored on the improve path and the loop always used the library default.
+  const contextBudget = contextBudgetFrom(parsed, config)
   const verifyCommand = flagValue(parsed, '--verify-cmd') ?? DEFAULT_VERIFY_COMMAND
   const commit = flagEnabled(parsed, '--commit')
   const dryRun = flagEnabled(parsed, '--dry-run')
@@ -1197,6 +1205,7 @@ async function cmdImprove(args: string[]): Promise<number> {
     commit,
     dryRun,
     createBranch,
+    ...(contextBudget !== undefined ? { contextBudget } : {}),
   })
 
   persistUsage({

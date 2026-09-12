@@ -12,16 +12,23 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { describe, it, expect } from 'vitest'
 
 import { commit as gitCommit, init, stageAll } from '../lib/git.js'
-import { runImprovement, guardTools, verifyRepo, type VerifyResult } from '../lib/improve.js'
+import {
+  runImprovement,
+  guardTools,
+  verifyRepo,
+  defaultImproveSystemPrompt,
+  createSteeringLlmClient,
+  type VerifyResult,
+} from '../lib/improve.js'
 import { createMockLlmClient } from '../lib/llm.js'
 import { createCoreTools, executeTool } from '../lib/tools.js'
-import type { LlmClient, ToolDef } from '../lib/types.js'
+import type { ChatMessage, LlmClient, LlmRequest, ToolDef } from '../lib/types.js'
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures + helpers                                                         */
@@ -112,6 +119,13 @@ function countingLlm(): { llm: LlmClient; calls: () => number } {
 function writeThenFinish(path: string, content = 'hello\n'): LlmClient {
   return createMockLlmClient([
     { content: null, toolCalls: [{ id: 'write-1', name: 'write_file', args: { path, content } }] },
+    { content: null, toolCalls: [{ id: 'finish-1', name: 'finish', args: { summary: 'done' } }] },
+  ])
+}
+
+/** Scripted client: call `finish` immediately, changing nothing. */
+function finishOnly(): LlmClient {
+  return createMockLlmClient([
     { content: null, toolCalls: [{ id: 'finish-1', name: 'finish', args: { summary: 'done' } }] },
   ])
 }
@@ -494,6 +508,320 @@ describe('verifyRepo', () => {
       const result = await verifyRepo(dir, 'node -e "process.exit(3)"')
       expect(result.ok).toBe(false)
       expect(result.exitCode).toBe(3)
+    } finally {
+      cleanup(dir)
+    }
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* defaultImproveSystemPrompt                                                 */
+/* -------------------------------------------------------------------------- */
+
+describe('defaultImproveSystemPrompt', () => {
+  it('(a) is action-forcing and still contains the goal verbatim', () => {
+    const goal = 'add a --version flag to the CLI'
+    const prompt = defaultImproveSystemPrompt(goal)
+
+    expect(prompt).toContain(`Goal: ${goal}`)
+    expect(prompt).toContain(goal)
+
+    // Action-forcing directives (Deliverable 1).
+    expect(prompt).toMatch(/act, do not deliberate/i)
+    expect(prompt).toMatch(/do NOT write plans/i)
+    expect(prompt).toMatch(/do not survey the repository/i)
+    expect(prompt).toMatch(/within your FIRST THREE tool calls/i)
+    expect(prompt).toMatch(/prefer editing an existing file/i)
+    expect(prompt).toMatch(/only AFTER the change has been written/i)
+    expect(prompt).toMatch(/call the `finish` tool as soon as the goal is met/i)
+
+    // The rails are still stated.
+    expect(prompt).toContain('npm run verify')
+    expect(prompt).toContain('Never create branches, commit, push, or reset')
+    expect(prompt).toContain('allowlist')
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* createSteeringLlmClient                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Drive a steering-wrapped client for `steps` chats; return what was sent. */
+async function driveSteering(
+  maxSteps: number | undefined,
+  steps: number,
+  options?: { nudgeAt?: number; warnAt?: number },
+): Promise<{ requests: LlmRequest[]; injected: () => number; base: ChatMessage[] }> {
+  const requests: LlmRequest[] = []
+  const inner: LlmClient = {
+    chat: async (req) => {
+      requests.push(req)
+      return { content: 'noop' }
+    },
+  }
+  const steering = createSteeringLlmClient(inner, { maxSteps, ...options })
+  const base: ChatMessage[] = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'goal' },
+  ]
+  for (let i = 0; i < steps; i++) {
+    await steering.client.chat({ model: 'mock', messages: base })
+  }
+  return { requests, injected: steering.injected, base }
+}
+
+/** The steering reminder the decorator appended to a request, if any. */
+function steeringOf(req: LlmRequest): string | undefined {
+  const last = req.messages[req.messages.length - 1]
+  if (last?.role === 'user' && typeof last.content === 'string' && /^Step \d+ of \d+:/.test(last.content)) {
+    return last.content
+  }
+  return undefined
+}
+
+describe('createSteeringLlmClient', () => {
+  it('(b) nudges at 60% and warns hard at 85% of the budget', async () => {
+    const { requests, injected } = await driveSteering(10, 10)
+
+    // Steps 1-5 untouched; step 6 nudges; steps 7-8 stay quiet; step 9 warns.
+    expect(steeringOf(requests[4])).toBeUndefined()
+    const nudge = steeringOf(requests[5])
+    expect(nudge).toBeDefined()
+    expect(nudge ?? '').toContain('Step 6 of 10')
+    expect(nudge ?? '').toContain('WRITE the change now')
+    expect(steeringOf(requests[6])).toBeUndefined()
+    expect(steeringOf(requests[7])).toBeUndefined()
+    const warn = steeringOf(requests[8])
+    expect(warn).toBeDefined()
+    expect(warn ?? '').toContain('Step 9 of 10')
+    expect(warn ?? '').toContain('only 1 step remaining')
+    expect(warn ?? '').toContain('`finish`')
+    expect(steeringOf(requests[9])).toBeUndefined()
+
+    expect(injected()).toBe(2)
+  })
+
+  it('(c) injects each tier at most once and at most one message per step', async () => {
+    const { requests, injected } = await driveSteering(10, 12)
+
+    const added = requests.map((req) => req.messages.length - 2)
+    expect(added.every((extra) => extra >= 0 && extra <= 1)).toBe(true)
+
+    const reminders = requests
+      .map(steeringOf)
+      .filter((content): content is string => content !== undefined)
+    expect(reminders).toHaveLength(2)
+    expect(reminders.filter((content) => content.includes('Stop exploring'))).toHaveLength(1)
+    expect(reminders.filter((content) => content.includes('IMMEDIATELY'))).toHaveLength(1)
+    expect(injected()).toBe(2)
+  })
+
+  it('(d) is inert when maxSteps is undefined or <= 0', async () => {
+    for (const maxSteps of [undefined, 0, -3]) {
+      const { requests, injected } = await driveSteering(maxSteps, 12)
+      expect(requests.every((req) => req.messages.length === 2)).toBe(true)
+      expect(injected()).toBe(0)
+    }
+  })
+
+  it("(e) never mutates the caller's array or its message objects", async () => {
+    const { requests, base } = await driveSteering(10, 10)
+    const snapshot = JSON.parse(JSON.stringify(base)) as ChatMessage[]
+
+    // The caller's array still holds exactly the two original messages...
+    expect(base).toEqual(snapshot)
+    expect(base).toHaveLength(2)
+    // ...and is never the same array handed to the inner client on a steered step.
+    expect(requests[5].messages).not.toBe(base)
+    // The appended reminder is new; the original message objects keep identity.
+    expect(requests[5].messages[0]).toBe(base[0])
+    expect(requests[5].messages[1]).toBe(base[1])
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Steering + artifacts inside runImprovement                                 */
+/* -------------------------------------------------------------------------- */
+
+describe('runImprovement steering', () => {
+  it('(b) injects reminders, records them, and never leaks them into the transcript', async () => {
+    const dir = tempRepo()
+    try {
+      const seen: LlmRequest[] = []
+      let calls = 0
+      const llm: LlmClient = {
+        chat: async (req) => {
+          seen.push(req)
+          calls += 1
+          return {
+            content: null,
+            toolCalls: [{ id: `call-${calls}`, name: 'list_files', args: { path: '.' } }],
+          }
+        },
+      }
+
+      const report = await runImprovement({
+        llm,
+        goal: 'never finish',
+        cwd: dir,
+        maxSteps: 10,
+        runVerify: async (_cwd: string, command: string): Promise<VerifyResult> => greenVerify(command),
+      })
+
+      expect(report.agent?.steps).toBe(10)
+      expect(report.steeringInjected).toBe(2)
+
+      const steered = seen.filter((req) =>
+        req.messages.some(
+          (message) => message.role === 'user' && /^Step \d+ of 10:/.test(message.content ?? ''),
+        ),
+      )
+      expect(steered).toHaveLength(2)
+      expect(steered[0].messages[steered[0].messages.length - 1].content).toContain('Step 6 of 10')
+      expect(steered[1].messages[steered[1].messages.length - 1].content).toContain('Step 9 of 10')
+
+      // The outbound reminders must NOT have corrupted the loop's own transcript.
+      const leaked = (report.agent?.messages ?? []).some(
+        (message) =>
+          typeof message.content === 'string' && message.content.includes('Step 6 of 10'),
+      )
+      expect(leaked).toBe(false)
+    } finally {
+      cleanup(dir)
+    }
+  })
+})
+
+describe('runImprovement artifacts', () => {
+  it('(f) writes changed.patch (including untracked files) and report.json', async () => {
+    const dir = tempRepo()
+    try {
+      const report = await runImprovement({
+        llm: writeThenFinish('lib/new-file.ts', 'export const answer = 42\n'),
+        goal: 'add lib/new-file.ts',
+        cwd: dir,
+        runVerify: async (_cwd: string, command: string): Promise<VerifyResult> => greenVerify(command),
+      })
+
+      expect(report.ok).toBe(true)
+      expect(report.artifactsDir).toBeDefined()
+      const artifactsDir = report.artifactsDir as string
+      expect(artifactsDir).toContain(join('.zoo', 'improve'))
+
+      const patch = readFileSync(join(artifactsDir, 'changed.patch'), 'utf-8')
+      expect(patch).toContain('lib/new-file.ts')
+      expect(patch).toContain('+export const answer = 42')
+
+      const parsed = JSON.parse(readFileSync(join(artifactsDir, 'report.json'), 'utf-8')) as {
+        ok: boolean
+        goal: string
+        artifactsDir?: string
+        steeringInjected?: number
+      }
+      expect(parsed.ok).toBe(true)
+      expect(parsed.goal).toBe('add lib/new-file.ts')
+      expect(parsed.artifactsDir).toBe(artifactsDir)
+      expect(parsed.steeringInjected).toBe(0)
+    } finally {
+      cleanup(dir)
+    }
+  })
+
+  it('(g) preserves partial progress when the run FAILS by step exhaustion', async () => {
+    const dir = tempRepo()
+    try {
+      let calls = 0
+      const llm: LlmClient = {
+        chat: async () => {
+          calls += 1
+          if (calls === 1) {
+            return {
+              content: null,
+              toolCalls: [
+                {
+                  id: 'write-1',
+                  name: 'write_file',
+                  args: { path: 'partial.ts', content: 'export const partial = true\n' },
+                },
+              ],
+            }
+          }
+          return {
+            content: null,
+            toolCalls: [{ id: `call-${calls}`, name: 'list_files', args: { path: '.' } }],
+          }
+        },
+      }
+
+      const report = await runImprovement({
+        llm,
+        goal: 'never finish',
+        cwd: dir,
+        maxSteps: 3,
+        runVerify: async (_cwd: string, command: string): Promise<VerifyResult> => greenVerify(command),
+      })
+
+      expect(report.agent?.ok).toBe(false)
+      expect(report.agent?.error ?? '').toContain('Max steps')
+      expect(report.ok).toBe(false)
+      expect(report.artifactsDir).toBeDefined()
+
+      const patch = readFileSync(join(report.artifactsDir as string, 'changed.patch'), 'utf-8')
+      expect(patch).toContain('partial.ts')
+      expect(patch).toContain('+export const partial = true')
+    } finally {
+      cleanup(dir)
+    }
+  })
+
+  it('(h) leaves the repo clean: artifacts are ignored and nothing is left staged', async () => {
+    const dir = tempRepo()
+    try {
+      const report = await runImprovement({
+        llm: finishOnly(),
+        goal: 'no-op',
+        cwd: dir,
+        runVerify: async (_cwd: string, command: string): Promise<VerifyResult> => greenVerify(command),
+      })
+
+      expect(report.ok).toBe(true)
+      expect(report.artifactsDir).toBeDefined()
+      expect(existsSync(join(report.artifactsDir as string, 'changed.patch'))).toBe(true)
+
+      // The artifacts exist on disk yet the tree reports CLEAN — proof they are
+      // ignored — and nothing is staged.
+      expect(porcelainAll(dir)).toBe('')
+      expect(porcelain(dir)).toBe('')
+      const staged = (
+        execSync('git diff --cached --name-only', { cwd: dir, encoding: 'utf-8' }) as string
+      ).trim()
+      expect(staged).toBe('')
+    } finally {
+      cleanup(dir)
+    }
+  })
+
+  it('(i) an artifacts-write failure does not change ok', async () => {
+    const dir = tempRepo()
+    try {
+      // Obstruct the artifact path with a committed FILE named `.zoo/improve` so
+      // the mkdir/write under it fails while the tree stays clean.
+      mkdirSync(join(dir, '.zoo'), { recursive: true })
+      writeFileSync(join(dir, '.zoo', 'improve'), 'obstruction\n')
+      stageAll(dir)
+      const committed = gitCommit(dir, 'chore: obstruct the artifacts path')
+      expect(committed.ok).toBe(true)
+
+      const report = await runImprovement({
+        llm: writeThenFinish('ok.txt'),
+        goal: 'still succeeds',
+        cwd: dir,
+        runVerify: async (_cwd: string, command: string): Promise<VerifyResult> => greenVerify(command),
+      })
+
+      expect(report.ok).toBe(true)
+      expect(report.artifactsDir).toBeUndefined()
+      expect(report.preflight.notes.join('\n')).toMatch(/could not write improve artifacts/i)
     } finally {
       cleanup(dir)
     }

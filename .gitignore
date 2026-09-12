@@ -18,3 +18,9 @@ vitest-out.json
 # Local usage telemetry: the append-only token ledger. `.zoo/state.json`
 # (persistent context memory) stays tracked; this file is per-machine.
 .zoo/usage.jsonl
+
+# Partial-progress artifacts from `zoocode improve`. If these were tracked, the
+# run's own output would dirty `git status` and the NEXT run's clean-tree
+# preflight would refuse to start. The loop also adds this path to the target
+# repo's `.git/info/exclude`, but the rule lives here for humans and fresh clones.
+.zoo/improve/
