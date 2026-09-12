@@ -7,6 +7,8 @@ graphify-out/
 # Never commit local secrets (API keys live in the environment, not in files).
 .env
 .env.*
+# ...but the template IS documentation and must be tracked.
+!.env.example
 
 # Scratch artifacts from agent runs — never commit these.
 .tmp-*
