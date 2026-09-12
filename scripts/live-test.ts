@@ -25,6 +25,13 @@
  *
  * SECURITY: the API key is never printed, logged, or serialized. The only
  * thing ever surfaced about it is a boolean `apiKeyPresent`.
+ *
+ * ACCOUNTING: a completed run also appends ONE aggregate entry to the local
+ * usage ledger (`.zoo/usage.jsonl`) via `recordUsage` — same `kind: 'agent'`
+ * shape and the same two documented skips (`ZOO_NO_USAGE=1`, zero total tokens)
+ * as the CLI's `withUsageRecording` / `persistUsage` pair in
+ * [`bin/zoocode.ts`](../bin/zoocode.ts). Ledger failures are reported on stderr
+ * and never change the exit code.
  */
 
 import { dirname, resolve } from 'node:path'
@@ -35,6 +42,7 @@ import { loadDotenv } from '../lib/dotenv.js'
 import { createMessages, runAgent } from '../lib/harness.js'
 import { DEFAULT_TIMEOUT_MS, createDeepSeekClient } from '../lib/llm.js'
 import { createCoreTools } from '../lib/tools.js'
+import { makeRunId, recordUsage, type UsageEntry } from '../lib/usage.js'
 import type { AgentEvent, LlmClient, LlmRequest, LlmResponse } from '../lib/types.js'
 
 /* -------------------------------------------------------------------------- */
@@ -56,6 +64,9 @@ const SYSTEM_PROMPT =
 const SET_KEY_COMMAND =
   '[Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-...", "User")   # then restart VS Code'
 const RUN_COMMAND = 'npx tsx scripts/live-test.ts'
+
+/** Max length of the `label` written to the ledger (mirrors the CLI's cap). */
+const LABEL_MAX = 80
 
 /* -------------------------------------------------------------------------- */
 /* Arg parsing (hand-rolled, no dependencies)                                 */
@@ -178,6 +189,64 @@ function createRecordingClient(inner: LlmClient): RecordingLlm {
   }
 
   return { client, usage }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Usage ledger                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Append the run's token usage to `<REPO_ROOT>/.zoo/usage.jsonl`.
+ *
+ * The totals come from the recording wrapper above (the harness event stream
+ * deliberately carries no usage), `steps` from the run result, and the rest from
+ * the run itself. Two skips keep the local ledger meaningful, exactly as
+ * `persistUsage` in [`bin/zoocode.ts`](../bin/zoocode.ts) documents them:
+ *  - `ZOO_NO_USAGE=1` — an explicit opt-out for scripts and CI.
+ *  - **zero total tokens** — nothing to account for, so nothing is written.
+ *
+ * A run is `ok` for accounting purposes only when it both succeeded AND verified
+ * live tool use, i.e. the same value the exit code is derived from. Never
+ * throws: an unwritable ledger is reported on stderr and ignored.
+ */
+function recordRunUsage(input: {
+  model: string
+  steps: number
+  durationMs: number
+  ok: boolean
+  label: string
+  recorder: RecordingLlm
+}): void {
+  try {
+    if (process.env.ZOO_NO_USAGE === '1') return
+
+    const { promptTokens, completionTokens } = input.recorder.usage
+    const totalTokens = promptTokens + completionTokens
+    if (totalTokens === 0) return
+
+    const entry: UsageEntry = {
+      ts: new Date().toISOString(),
+      kind: 'agent',
+      model: input.model,
+      runId: makeRunId(),
+      steps: input.steps,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      durationMs: input.durationMs,
+      ok: input.ok,
+    }
+    const label = truncate(input.label, LABEL_MAX)
+    if (label.length > 0) entry.label = label
+
+    const recorded = recordUsage(entry)
+    if (!recorded.ok) {
+      console.error(`[usage] not recorded: ${recorded.error ?? 'unknown error'}`)
+    }
+  } catch (err) {
+    // Telemetry must never be able to fail the live test (or change its exit code).
+    console.error(`[usage] not recorded: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 interface ToolCallRecord {
@@ -394,6 +463,17 @@ async function main(): Promise<number> {
   const usedAtLeastOneTool = toolsUsed.length > 0
   const finalNonEmpty = result.final.trim().length > 0
   const pass = result.ok && usedAtLeastOneTool && finalNonEmpty
+
+  // Accounting is a by-product of a completed run: it happens once, before the
+  // report is rendered, so BOTH --json and human output lead to the same ledger.
+  recordRunUsage({
+    model,
+    steps: result.steps,
+    durationMs,
+    ok: pass,
+    label: options.task,
+    recorder: recording,
+  })
 
   const report: LiveReport = {
     ok: result.ok,
