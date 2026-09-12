@@ -2,15 +2,23 @@
   "name": "zoocode",
   "private": true,
   "version": "0.0.1",
-  "description": "Zoo's personal tooling workshop — scripts, templates, and utilities for DIY coding projects",
+  "description": "Homegrown agent harness — a layered LLM agent loop, tools, sub-agents, and CLI",
   "type": "module",
+  "bin": {
+    "zoocode": "bin/zoocode.ts"
+  },
   "scripts": {
+    "zoocode": "tsx bin/zoocode.ts",
+    "agent": "tsx bin/zoocode.ts agent",
+    "doctor": "tsx bin/zoocode.ts doctor",
     "scaffold": "tsx scripts/scaffold.ts",
     "analyze": "tsx scripts/analyze.ts",
     "search": "tsx scripts/search.ts",
+    "live": "tsx scripts/live-test.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "oxlint"
+    "lint": "oxlint",
+    "verify": "oxlint && tsc --noEmit && vitest run"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",

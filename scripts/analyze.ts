@@ -7,7 +7,7 @@
 
 import { existsSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { collectFiles, getProjectSummary } from '../lib/files.js'
+import { getProjectSummary } from '../lib/files.js'
 import * as logger from '../lib/logger.js'
 
 function usage(): never {

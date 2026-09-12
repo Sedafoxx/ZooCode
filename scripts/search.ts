@@ -15,7 +15,6 @@ import { execSync } from 'node:child_process'
 import * as logger from '../lib/logger.js'
 
 const VSCodeDir = 'C:/Users/dchy/Documents/VSCode'
-const SkipDirs = ['node_modules', '.git', '.claude', '.playwright-mcp', 'graphify-out', 'dist', '__pycache__', '.vite']
 
 function usage(): never {
   console.log(`

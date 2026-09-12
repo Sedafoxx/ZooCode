@@ -3,3 +3,16 @@ dist/
 *.tsbuildinfo
 .vite/
 graphify-out/
+
+# Never commit local secrets (API keys live in the environment, not in files).
+.env
+.env.*
+
+# Scratch artifacts from agent runs — never commit these.
+.tmp-*
+tmp-*
+vitest-out.json
+
+# Local usage telemetry: the append-only token ledger. `.zoo/state.json`
+# (persistent context memory) stays tracked; this file is per-machine.
+.zoo/usage.jsonl

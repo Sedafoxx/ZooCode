@@ -1,8 +1,8 @@
 #!/usr/bin/env tsx
 /**
- * Scaffold a new TypeScript project from the base template.
+ * Scaffold a new TypeScript project from a registered template.
  *
- * Usage: tsx scripts/scaffold.ts <project-name> [target-dir]
+ * Usage: tsx scripts/scaffold.ts [--template <name>] <project-name> [target-dir]
  *
  * If target-dir is omitted, the project is created in the VSCode directory
  * alongside the other projects.
@@ -11,32 +11,64 @@
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { init, initialCommit, isGitRepo } from '../lib/git.js'
-import { ensureDir, scaffoldFromTemplate, type FileEntry } from '../lib/files.js'
+import { scaffoldFromTemplate } from '../lib/files.js'
 import * as logger from '../lib/logger.js'
+import { resolveTemplateFiles, listTemplates, DEFAULT_TEMPLATE } from '../lib/templates.js'
 
 const DEFAULT_PARENT = 'C:/Users/dchy/Documents/VSCode'
 
 function usage(): never {
+  const templates = listTemplates()
+    .map((t) => `  ${t.name.padEnd(12)} ${t.description}`)
+    .join('\n')
   console.log(`
-  Usage: tsx scripts/scaffold.ts <project-name> [target-dir]
+  Usage: tsx scripts/scaffold.ts [--template <name>] <project-name> [target-dir]
 
-  Creates a new TypeScript project from the base template.
+  Creates a new TypeScript project from a registered template.
 
   Arguments:
     project-name   Name of the project (and directory)
     target-dir     Parent directory (default: ${DEFAULT_PARENT})
 
+  Options:
+    --template     Template to use (default: ${DEFAULT_TEMPLATE})
+
+  Templates:
+${templates}
+
   Example:
     tsx scripts/scaffold.ts my-cool-project
-    tsx scripts/scaffold.ts my-cool-project C:/Users/dchy/Desktop
+    tsx scripts/scaffold.ts --template lib my-lib
   `)
   process.exit(1)
 }
 
-const projectName = process.argv[2]
+// --- Parse arguments: --template <name> plus positional <project-name> [target-dir] ---
+const rawArgs = process.argv.slice(2)
+let templateName = DEFAULT_TEMPLATE
+const positionals: string[] = []
+
+for (let i = 0; i < rawArgs.length; i++) {
+  const arg = rawArgs[i]
+  if (arg === '--template') {
+    const value = rawArgs[i + 1]
+    if (!value || value.startsWith('--')) {
+      logger.error('Missing value for --template')
+      usage()
+    }
+    templateName = value
+    i++
+  } else if (arg.startsWith('--template=')) {
+    templateName = arg.slice('--template='.length)
+  } else {
+    positionals.push(arg)
+  }
+}
+
+const projectName = positionals[0]
 if (!projectName) usage()
 
-const targetParent = process.argv[3] || DEFAULT_PARENT
+const targetParent = positionals[1] || DEFAULT_PARENT
 const targetDir = join(targetParent, projectName)
 
 if (existsSync(targetDir)) {
@@ -46,81 +78,15 @@ if (existsSync(targetDir)) {
 
 logger.header(`Scaffolding "${projectName}"`)
 logger.info(`Target: ${targetDir}`)
+logger.info(`Template: ${templateName}`)
 
-// --- Template files ---
-const files: FileEntry[] = [
-  {
-    path: 'package.json',
-    content: JSON.stringify(
-      {
-        name: projectName,
-        private: true,
-        version: '0.0.1',
-        type: 'module',
-        scripts: {
-          build: 'tsc',
-          start: 'node dist/index.js',
-          dev: 'tsx watch src/index.ts',
-          lint: 'oxlint',
-        },
-        devDependencies: {
-          '@types/node': '^24.0.0',
-          oxlint: '^1.71.0',
-          tsx: '^4.19.0',
-          typescript: '~6.0.2',
-        },
-      },
-      null,
-      2,
-    ),
-  },
-  {
-    path: 'tsconfig.json',
-    content: JSON.stringify(
-      {
-        compilerOptions: {
-          target: 'es2023',
-          lib: ['ES2023'],
-          module: 'esnext',
-          moduleResolution: 'bundler',
-          allowImportingTsExtensions: true,
-          verbatimModuleSyntax: true,
-          moduleDetection: 'force',
-          noEmit: true,
-          erasableSyntaxOnly: true,
-          strict: true,
-          skipLibCheck: true,
-          types: ['node'],
-        },
-        include: ['src'],
-      },
-      null,
-      2,
-    ),
-  },
-  {
-    path: '.gitignore',
-    content: 'node_modules/\ndist/\n*.tsbuildinfo\n',
-  },
-  {
-    path: 'README.md',
-    content: `# ${projectName}\n\nA TypeScript project bootstrapped by ZooCode.\n`,
-  },
-  {
-    path: 'src/index.ts',
-    content: `/**
- * ${projectName}
- * Bootstrapped by ZooCode.
- */
-
-function main(): void {
-  console.log('Hello from ${projectName}!')
+// --- Resolve template files ---
+const resolved = resolveTemplateFiles(templateName, projectName)
+if (!resolved.ok) {
+  logger.error(resolved.error ?? `Unknown template: ${templateName}`)
+  process.exit(1)
 }
-
-main()
-`,
-  },
-]
+const files = resolved.data!
 
 // --- Execute ---
 logger.step('Creating project structure...')
