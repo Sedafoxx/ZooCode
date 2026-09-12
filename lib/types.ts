@@ -5,6 +5,10 @@
  * names verbatim. Treat this file as append-only: do not rename existing members.
  */
 
+// Type-only (erased at runtime) so the contract can name the context-budget
+// shapes without creating a runtime dependency edge on `lib/context-budget.ts`.
+import type { ContextBudgetOptions, ContextStats } from './context-budget.js'
+
 export type Role = 'system' | 'user' | 'assistant' | 'tool'
 
 export interface ToolCall {
@@ -80,6 +84,8 @@ export type AgentEvent =
   | { type: 'llm_response'; step: number; content: string | null; toolCallCount: number }
   | { type: 'tool_call'; step: number; tool: string; args: Record<string, unknown> }
   | { type: 'tool_result'; step: number; tool: string; ok: boolean; content: string }
+  // Emitted (only) when the step's outbound transcript was actually pruned.
+  | { type: 'context_pruned'; step: number; stats: ContextStats }
   | { type: 'done'; steps: number; final: string }
   | { type: 'error'; step: number; error: string }
 
@@ -93,6 +99,13 @@ export interface RunAgentOptions {
   cwd?: string
   signal?: AbortSignal
   onEvent?: (event: AgentEvent) => void
+  /**
+   * Estimated-token ceiling for the transcript handed to the model on each step.
+   * Omitted fields fall back to `DEFAULT_CONTEXT_BUDGET` in `lib/context-budget.ts`.
+   * This only affects the OUTBOUND request; `RunAgentResult.messages` still holds
+   * the full transcript.
+   */
+  contextBudget?: Partial<ContextBudgetOptions>
 }
 
 export interface RunAgentResult {
@@ -101,6 +114,12 @@ export interface RunAgentResult {
   final: string
   steps: number
   error?: string
+  /**
+   * The LAST applied `ContextStats` of the run — i.e. the one from the most
+   * recent step that pruned — or `undefined` when nothing was ever pruned.
+   * Per-step stats are also available on the `context_pruned` event.
+   */
+  context?: ContextStats
 }
 
 export interface SubTask {

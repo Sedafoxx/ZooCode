@@ -14,12 +14,15 @@ L2  lib/harness.ts      agentic loop       runAgent · events · termination
 L1  lib/llm.ts          the LLM seam       createDeepSeekClient · createMockLlmClient
     lib/tools.ts        tool registry      createCoreTools · executeTool · getTool
     lib/policy.ts       execution policy   evaluateCommand · modes · deny patterns
+    lib/context-budget.ts context budget   applyContextBudget · groupMessages · stats
     │
 L0  lib/types.ts        THE CONTRACT       ChatMessage · ToolDef · AgentEvent · …
     lib/config.ts       configuration      loadConfig · env > overrides
 ```
 
 Supporting (side) modules that are orthogonal to the loop:
+[`lib/context-budget.ts`](../lib/context-budget.ts) (bounded outbound context —
+see [§5b](#5b-context-budgeting-l2-helper)),
 [`lib/context.ts`](../lib/context.ts) (persistent `.zoo/state.json` memory),
 [`lib/usage.ts`](../lib/usage.ts) (append-only token ledger + estimated cost),
 [`lib/doctor.ts`](../lib/doctor.ts) (toolchain probe),
@@ -39,7 +42,7 @@ other layer. The load-bearing pieces:
 | `ChatMessage` | The transcript unit (`role`, `content`, optional `toolCalls` / `toolCallId` / `name`). |
 | `ToolDef` | `{ name, description, parameters, handler }` — the only shape the registry and the model care about. |
 | `ToolContext` | `{ cwd, signal? }`. Handlers resolve relative paths against `ctx.cwd`, never `process.cwd()`. |
-| `AgentEvent` | The typed observation stream: `llm_request`, `llm_response`, `tool_call`, `tool_result`, `done`, `error`. |
+| `AgentEvent` | The typed observation stream: `llm_request`, `llm_response`, `tool_call`, `tool_result`, `context_pruned`, `done`, `error`. |
 | `RunAgentOptions` / `RunAgentResult` | The loop's input/output. `RunAgentOptions.model?` is an explicit override; [`resolveModel`](../lib/harness.ts) falls back to `DEEPSEEK_MODEL` → the shared `DEFAULT_MODEL` (`deepseek-chat`) from [`lib/config.ts`](../lib/config.ts). |
 | `SubTask` | `{ id, prompt, system?, tools? }` — the unit fanned out by L3. |
 
@@ -63,10 +66,13 @@ DEEPSEEK_MODEL     → deepseek-chat
 ZOO_MAX_STEPS      → 25
 ZOO_CONCURRENCY    → 3
 ZOO_TEMPERATURE    → 0.2
+ZOO_CONTEXT_BUDGET_TOKENS → 48000    (estimated-token ceiling for one request)
+ZOO_CONTEXT_KEEP_GROUPS   → 6        (most-recent message groups kept verbatim)
 ```
 
-Counters are floored and must be `>= 1`; temperature must be `>= 0`; blank
-strings are treated as absent. It never throws.
+Counters are floored and must be `>= 1`; temperature must be `>= 0`;
+`ZOO_CONTEXT_KEEP_GROUPS` may be `0` (keep nothing extra — the final group is
+still always protected); blank strings are treated as absent. It never throws.
 
 ## 3. The LLM seam (L1)
 
@@ -176,6 +182,69 @@ Other invariants: the caller's `messages` array is copied (never mutated); a
 throwing `onEvent` observer is swallowed so it cannot break the run; the loop
 checks `signal.aborted` before each step and each tool call.
 
+Immediately before every `llm.chat`, the loop passes the transcript through
+`applyContextBudget` (§5b) to bound the **outbound** request. Only the request is
+pruned: `RunAgentResult.messages` remains the full history, and when a step
+actually prunes the loop emits `context_pruned` and records the stats as
+`RunAgentResult.context` (the last applied stats, or absent when nothing was
+pruned). With no `contextBudget` option the shared `DEFAULT_CONTEXT_BUDGET`
+applies, so every run is bounded by default.
+
+## 5b. Context budgeting (L2 helper)
+
+[`lib/context-budget.ts`](../lib/context-budget.ts) is pure, deterministic and
+never throws. It exists because the loop re-sends the whole transcript every
+step — a measured 52-step run re-sent ~1.7M prompt tokens — so the transcript
+handed to the model must be bounded.
+
+**The grouping invariant.** DeepSeek is OpenAI-compatible: an assistant message
+carrying `toolCalls` makes the request invalid unless the messages *immediately
+following it* provide a `tool` result for **every** `toolCallId`, with no other
+message type interleaved. Pruning therefore operates on whole **groups**, never
+on individual messages:
+
+- a **group** = an `assistant` message with `toolCalls` + ALL the `tool` messages
+  that immediately follow it;
+- every other message is its own single-message group.
+
+Two operations are legal, and only these two:
+
+| Operation | Effect | Why it is safe |
+| --- | --- | --- |
+| **Elide** a tool result's `content` | The message, its `toolCallId`, its `name` and its position are untouched; only the text is replaced by a short marker naming the tool and a recovering argument hint. | The call/result pairing is byte-for-byte intact. |
+| **Drop** a whole group | The assistant `toolCalls` message and ALL of its `tool` results are removed together. | A call is never separated from its results, and no result outlives its call. |
+
+A subset of a group is never dropped, and groups are never reordered.
+
+**The two passes** (exact order):
+
+1. estimate tokens; at or under budget → return the input **unchanged**
+   (`pruned: false`);
+2. group the messages and size each group;
+3. mark **protected** groups — any group containing a `system` message, the group
+   of the FIRST `user` message (the task), the last `keepRecentGroups` groups, and
+   always the final group. Protected groups are never elided and never dropped;
+4. **pass 1 — elide** (oldest unprotected group first): replace each `tool`
+   content longer than `minElideChars` with a marker, re-estimate after every
+   elision and stop the moment the estimate fits;
+5. **pass 2 — drop** (only if still over budget): remove whole unprotected
+   groups, oldest first, again stopping as soon as it fits;
+6. return a NEW array — unmodified messages are reused by reference, modified
+   ones are clones — plus `ContextStats`.
+
+`estimateTokens` is `ceil(chars / 4) + 1`, documented in the source as an
+**estimate** and never as a tokenization. Idempotence is structural: already
+elided content is recognised by its marker prefix and skipped, so running the
+pruner on its own output cannot double-elide.
+
+The defaults live in [`lib/config.ts`](../lib/config.ts)
+(`DEFAULT_CONTEXT_BUDGET_TOKENS` = 48000, `DEFAULT_CONTEXT_KEEP_GROUPS` = 6) and
+are surfaced as `DEFAULT_CONTEXT_BUDGET`; the CLI maps
+`--context-budget <tokens>` / `--keep-recent <n>` — or the two env vars — onto
+`RunAgentOptions.contextBudget`. `runParallel` forwards the same option to every
+sub-task. The CLI writes one `[context] pruned: …` line to **stderr** and exposes
+the stats as `context` in `--json`.
+
 ## 6. The concurrency model (L3)
 
 [`runParallel(tasks, options)`](../lib/subagent.ts:153) fans `SubTask`s out over
@@ -224,7 +293,12 @@ stdout/stderr, and exit codes:
 - The active policy is never invisible: `zoocode help` prints the CLI default and
   `agent` / `run` write `[exec-policy] …` to **stderr** so `--json` stays clean.
 - `--events` renders `AgentEvent`s to **stderr**, keeping `--json` payloads clean
-  on stdout.
+  on stdout. `context_pruned` is rendered there too.
+- `--context-budget <tokens>` / `--keep-recent <n>` (on `agent`, `chat`, `run`)
+  build `RunAgentOptions.contextBudget`, falling back to
+  `ZOO_CONTEXT_BUDGET_TOKENS` / `ZOO_CONTEXT_KEEP_GROUPS` and then to
+  `DEFAULT_CONTEXT_BUDGET`. A step that prunes writes one `[context] pruned: …`
+  line to **stderr** and `--json` carries the last applied stats as `context`.
 - `chat` drives the loop over one accumulating transcript: the returned
   `result.messages` (which includes the just-finished turn) becomes the next
   turn's input.
@@ -330,18 +404,22 @@ npm run verify     # oxlint && tsc --noEmit && vitest run
 `erasableSyntaxOnly` are all on, so the type signature of every seam is enforced
 at the gate.
 
-`vitest run` covers **252 passing tests** (253 collected across 18 files; the
+`vitest run` covers **282 passing tests** (283 collected across 19 files; the
 1-test live-network suite in [`tests/live.test.ts`](../tests/live.test.ts) is
-skipped unless an API key is present, leaving 17 files that report passes):
-every lib module — including [`tests/policy.test.ts`](../tests/policy.test.ts)
+skipped unless an API key is present, leaving 18 files that report passes):
+every lib module — including the context pruner in
+[`tests/context-budget.test.ts`](../tests/context-budget.test.ts), the policy
+engine in [`tests/policy.test.ts`](../tests/policy.test.ts),
 and the self-improvement rails in
 [`tests/improve.test.ts`](../tests/improve.test.ts) — plus the hermetic CLI smoke
 tests in [`tests/cli.test.ts`](../tests/cli.test.ts), which spawn
 `npx tsx bin/zoocode.ts …` with no API key in the child environment.
 Those CLI tests reach the real policy path offline through the scripted mock's
 `mock-run: <command>` task prefix, which turns a fake task into one genuine
-`run_command` call. The **live** DeepSeek network path is otherwise **not**
-exercised by the automated suite.
+`run_command` call. A sibling `mock-long: <n>` prefix issues `<n>` large
+`read_file` calls, which is how the context-budget path — the stderr summary and
+the `--json` `context` stats — is exercised offline. The **live** DeepSeek
+network path is otherwise **not** exercised by the automated suite.
 
 ## 9. Build history
 
@@ -355,6 +433,7 @@ and locked before the next one started, so no worker ever edited another's files
 | 3 | L2 | `lib/harness.ts` | L2 worker — locked |
 | 4 | L3 | `lib/subagent.ts` | L3 worker — locked |
 | 5 | Support | `lib/context.ts`, `lib/files.ts`, `lib/search.ts`, `lib/doctor.ts`, `scripts/*` | support workers — locked |
+| 5b | **Context management** | `lib/context-budget.ts`, `lib/harness.ts`, `lib/types.ts`, `lib/config.ts`, `lib/subagent.ts`, `bin/zoocode.ts` | **C1** |
 | 6 | **L4 + wiring** | **`bin/zoocode.ts`, `package.json`, `tsconfig.json`, docs** | **F5** |
 | 7 | **Hardening + integration** | `lib/types.ts`, `lib/harness.ts`, `lib/tools.ts`, `lib/subagent.ts`, `bin/zoocode.ts`, tests, docs | **F6** |
 | 8 | **Execution safety** | **`lib/policy.ts`, `lib/tools.ts`, `bin/zoocode.ts`, tests, docs** | **S1** |
@@ -386,6 +465,17 @@ list in `guardTools`, forces the `allowlist` policy, and adds the preflight,
 branch-isolation, bounded-step, verify-gate and opt-in-commit rails described in
 §7c. Every new test is hermetic (temp git repos + mock LLM + injected gate), so
 the loop is never pointed at this repository by the suite.
+
+C1 (context management) added [`lib/context-budget.ts`](../lib/context-budget.ts)
+and wired it into `runAgent` immediately before each `llm.chat`, so the outbound
+request is bounded by default while `RunAgentResult.messages` keeps the full
+history. `RunAgentOptions.contextBudget`, the `context_pruned` event and
+`RunAgentResult.context` were added additively to the contract; `lib/config.ts`
+gained `ZOO_CONTEXT_BUDGET_TOKENS` / `ZOO_CONTEXT_KEEP_GROUPS`; and the CLI grew
+`--context-budget` / `--keep-recent` plus the stderr summary and the `--json`
+stats. The whole feature is offline-testable: the grouping/pairing invariant and
+the two passes are unit-tested, and a scripted multi-step mock proves a later
+request is smaller than the transcript returned to the caller.
 
 S1 put a real policy layer in front of the one tool that grants
 arbitrary code execution. The denylist moved out of `lib/tools.ts` into the new

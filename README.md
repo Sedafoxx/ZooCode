@@ -88,7 +88,8 @@ L0  Contract       lib/types.ts          ChatMessage · ToolDef · AgentEvent ·
                    lib/config.ts         env / override resolution
 ```
 
-Supporting modules: [`lib/context.ts`](lib/context.ts) (persistent
+Supporting modules: [`lib/context-budget.ts`](lib/context-budget.ts) (bounded
+outbound context), [`lib/context.ts`](lib/context.ts) (persistent
 `.zoo/state.json` memory), [`lib/usage.ts`](lib/usage.ts) (usage & cost ledger),
 [`lib/doctor.ts`](lib/doctor.ts) (toolchain checks),
 [`lib/files.ts`](lib/files.ts) (project summaries), [`lib/search.ts`](lib/search.ts)
@@ -103,9 +104,9 @@ termination semantics, and the concurrency model.
 
 ```
 zoocode tools [--json]
-zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--mock] [--json] [--events] [--exec-policy <mode>] [--allow-exec] [--no-exec]
-zoocode chat [--mock] [--system <text>] [--exec-policy <mode>] [--allow-exec] [--no-exec]
-zoocode run <file.json | -> [--concurrency N] [--mock] [--json] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+zoocode chat [--mock] [--system <text>] [--context-budget <tokens>] [--keep-recent <n>] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+zoocode run <file.json | -> [--concurrency N] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--exec-policy <mode>] [--allow-exec] [--no-exec]
 zoocode doctor [--json]
 zoocode analyze <dir> [--json]
 zoocode search <pattern> [--ext .ts] [--max N] [--project <name>] [--json]
@@ -135,6 +136,10 @@ zoocode help
   With no flag the CLI uses `ZOO_EXEC_POLICY`, else its default of `allowlist`.
   The active policy is always printed — in `zoocode help` and on the `agent` /
   `run` startup line.
+- `--context-budget <tokens>` / `--keep-recent <n>` — on `agent`, `chat`, and
+  `run`, bound the transcript handed to the model (see
+  [Context management](#context-management)). With no flag the CLI uses
+  `ZOO_CONTEXT_BUDGET_TOKENS` / `ZOO_CONTEXT_KEEP_GROUPS`, else the defaults.
 - `commit` / `scaffold` — passthroughs that spawn the existing
   [`scripts/commit.ts`](scripts/commit.ts) / [`scripts/scaffold.ts`](scripts/scaffold.ts)
   with inherited stdio.
@@ -242,6 +247,72 @@ A model with **no known price reports cost `0` and is listed under
 price is never silently read as "free". For the authoritative number, see your
 DeepSeek dashboard/invoice.
 
+## Context management
+
+The loop re-sends the **whole** transcript on every step, so a long run grows
+quadratically: a measured 52-step run re-sent ~1.7M prompt tokens (~33k per
+step). Before each request, [`lib/context-budget.ts`](lib/context-budget.ts)
+bounds the OUTBOUND transcript; the history returned to the caller (and shown in
+`chat`) is always complete.
+
+**The invariant that cannot break.** DeepSeek is OpenAI-compatible, so an
+assistant message with `toolCalls` is *rejected* unless the messages immediately
+after it answer **every** `toolCallId` with a `tool` result, with nothing
+interleaved. Pruning therefore never touches individual messages — only whole
+**groups**:
+
+- a **group** = an `assistant` message carrying `toolCalls` **plus all of the
+  `tool` messages that immediately follow it**;
+- anything else (system prompt, user turn, plain assistant reply) is its own
+  single-message group.
+
+A tool result may have its **content elided** (the message, its `toolCallId` and
+its position stay exactly where they were), and a group may be **dropped whole**
+(the assistant call *and* all of its results together). A subset of a group is
+never dropped or reordered.
+
+**The algorithm, in order:**
+
+1. estimate the transcript; if it fits, return it unchanged (`pruned: false`);
+2. group the messages;
+3. **protect** the system prompt, the first user task, the last
+   `keepRecentGroups` groups, and always the final group;
+4. **pass 1 — elide**: oldest unprotected tool results first, replacing content
+   longer than `minElideChars` with a marker such as
+   `[elided 12345 chars from read_file: lib/foo.ts — call read_file again if you need it]`,
+   re-estimating after each elision and stopping as soon as it fits;
+5. **pass 2 — drop**: whole unprotected groups, oldest first, only if still over;
+6. return a NEW transcript (modified messages are clones; the input is never
+   mutated) plus exact `stats`.
+
+It is deterministic and idempotent: an already-elided result is recognised by its
+marker and skipped, so a second pass never double-elides. It never throws — a
+malformed transcript degrades to "no pruning".
+
+| Knob | Default | CLI | Environment |
+| --- | --- | --- | --- |
+| Estimated-token ceiling | `48000` | `--context-budget <tokens>` | `ZOO_CONTEXT_BUDGET_TOKENS` |
+| Recent groups kept verbatim | `6` | `--keep-recent <n>` | `ZOO_CONTEXT_KEEP_GROUPS` |
+| Minimum characters to elide | `400` | — | — |
+
+Defaults live in [`lib/config.ts`](lib/config.ts) (`DEFAULT_CONTEXT_BUDGET_TOKENS`,
+`DEFAULT_CONTEXT_KEEP_GROUPS`) and are re-exported as
+`DEFAULT_CONTEXT_BUDGET` from [`lib/context-budget.ts`](lib/context-budget.ts).
+
+**Token counts are estimates.** `estimateTokens` is `ceil(chars / 4) + 1`, a rule
+of thumb for English and source code — not tokenization. Real counts differ by
+model and content, so the budget is a guard rail, not a contract.
+
+When a step prunes, `runAgent` emits a `context_pruned` event and the CLI writes
+one compact line to **stderr** (stdout stays clean for `--json`):
+
+```
+[context] pruned: 48000 -> 31000 est. tokens (12 results elided, 3 groups dropped)
+```
+
+`--json` output carries the last applied stats as `context` (or `null` when
+nothing was pruned).
+
 ## Improving itself
 
 ZooCode can improve **its own source repository**:
@@ -307,17 +378,22 @@ npm run verify     # oxlint && tsc --noEmit && vitest run
   [`lib/doctor.ts`](lib/doctor.ts:38), which is intentional ANSI stripping).
 - `tsc --noEmit` — 0 errors under `strict`, `noUnusedLocals`,
   `noUnusedParameters`, `verbatimModuleSyntax`, `erasableSyntaxOnly`.
-- `vitest run` — 252 passing tests (253 collected across 18 files; the 1-test
+- `vitest run` — 282 passing tests (283 collected across 19 files; the 1-test
   live-network suite in [`tests/live.test.ts`](tests/live.test.ts) is skipped
-  when no API key is present, so 17 of the files report passes): every lib layer
-  — including the policy engine in [`tests/policy.test.ts`](tests/policy.test.ts)
+  when no API key is present, so 18 of the files report passes): every lib layer
+  — including the context pruner in
+  [`tests/context-budget.test.ts`](tests/context-budget.test.ts), the policy
+  engine in [`tests/policy.test.ts`](tests/policy.test.ts),
   and the self-improvement rails in
   [`tests/improve.test.ts`](tests/improve.test.ts) — plus hermetic CLI smoke tests
   ([`tests/cli.test.ts`](tests/cli.test.ts)) that spawn
   `npx tsx bin/zoocode.ts …` with no API key in the child environment and drive
   the real `run_command` policy path offline via a `--mock "mock-run: <command>"`
-  task. The **live** DeepSeek path is otherwise not part of the automated suite;
-  it is validated manually.
+  task. The [context budget](#context-management) path is driven the same way,
+  fully offline, by a `--mock "mock-long: 3"` task that reads a large file three
+  times — so the stderr summary and the `--json` `context` stats are covered
+  end-to-end. The **live** DeepSeek path is otherwise not part of the automated
+  suite; it is validated manually.
 
 ## Project layout
 

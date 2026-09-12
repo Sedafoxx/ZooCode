@@ -6,6 +6,8 @@ import {
   DEFAULT_MAX_STEPS,
   DEFAULT_CONCURRENCY,
   DEFAULT_TEMPERATURE,
+  DEFAULT_CONTEXT_BUDGET_TOKENS,
+  DEFAULT_CONTEXT_KEEP_GROUPS,
 } from '../lib/config.js'
 
 const KEYS = [
@@ -15,6 +17,8 @@ const KEYS = [
   'ZOO_MAX_STEPS',
   'ZOO_CONCURRENCY',
   'ZOO_TEMPERATURE',
+  'ZOO_CONTEXT_BUDGET_TOKENS',
+  'ZOO_CONTEXT_KEEP_GROUPS',
 ] as const
 
 const saved: Record<string, string | undefined> = {}
@@ -49,6 +53,8 @@ describe('loadConfig', () => {
       maxSteps: DEFAULT_MAX_STEPS,
       concurrency: DEFAULT_CONCURRENCY,
       temperature: DEFAULT_TEMPERATURE,
+      contextBudgetTokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
+      contextKeepGroups: DEFAULT_CONTEXT_KEEP_GROUPS,
     })
   })
 
@@ -70,6 +76,8 @@ describe('loadConfig', () => {
       maxSteps: 7,
       concurrency: 5,
       temperature: 0.9,
+      contextBudgetTokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
+      contextKeepGroups: DEFAULT_CONTEXT_KEEP_GROUPS,
     })
   })
 
@@ -98,6 +106,8 @@ describe('loadConfig', () => {
       maxSteps: 3,
       concurrency: 1,
       temperature: 0,
+      contextBudgetTokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
+      contextKeepGroups: DEFAULT_CONTEXT_KEEP_GROUPS,
     })
   })
 
@@ -142,6 +152,57 @@ describe('loadConfig', () => {
     expect(result.data?.maxSteps).toBe(DEFAULT_MAX_STEPS)
     expect(result.data?.concurrency).toBe(DEFAULT_CONCURRENCY)
     expect(result.data?.temperature).toBe(DEFAULT_TEMPERATURE)
+  })
+
+  it('resolves the context budget fields from their defaults', () => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test'
+
+    const result = loadConfig()
+
+    expect(result.ok).toBe(true)
+    expect(result.data?.contextBudgetTokens).toBe(DEFAULT_CONTEXT_BUDGET_TOKENS)
+    expect(result.data?.contextKeepGroups).toBe(DEFAULT_CONTEXT_KEEP_GROUPS)
+  })
+
+  it('reads the context budget env vars', () => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test'
+    process.env.ZOO_CONTEXT_BUDGET_TOKENS = '64000'
+    process.env.ZOO_CONTEXT_KEEP_GROUPS = '2'
+
+    const result = loadConfig()
+
+    expect(result.ok).toBe(true)
+    expect(result.data?.contextBudgetTokens).toBe(64_000)
+    expect(result.data?.contextKeepGroups).toBe(2)
+  })
+
+  it('lets context budget overrides beat env values', () => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test'
+    process.env.ZOO_CONTEXT_BUDGET_TOKENS = '64000'
+    process.env.ZOO_CONTEXT_KEEP_GROUPS = '2'
+
+    const result = loadConfig({ contextBudgetTokens: 8_000, contextKeepGroups: 0 })
+
+    expect(result.ok).toBe(true)
+    expect(result.data?.contextBudgetTokens).toBe(8_000)
+    expect(result.data?.contextKeepGroups).toBe(0) // 0 is meaningful: keep none
+  })
+
+  it('ignores invalid context budget values instead of throwing', () => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test'
+    process.env.ZOO_CONTEXT_BUDGET_TOKENS = 'not-a-number'
+    process.env.ZOO_CONTEXT_KEEP_GROUPS = '-3'
+
+    const result = loadConfig()
+
+    expect(result.ok).toBe(true)
+    expect(result.data?.contextBudgetTokens).toBe(DEFAULT_CONTEXT_BUDGET_TOKENS)
+    expect(result.data?.contextKeepGroups).toBe(DEFAULT_CONTEXT_KEEP_GROUPS)
+
+    // A zero/negative budget is unusable and falls back; a non-numeric one too.
+    const floored = loadConfig({ contextBudgetTokens: 0, contextKeepGroups: Number.NaN })
+    expect(floored.data?.contextBudgetTokens).toBe(DEFAULT_CONTEXT_BUDGET_TOKENS)
+    expect(floored.data?.contextKeepGroups).toBe(DEFAULT_CONTEXT_KEEP_GROUPS)
   })
 
   it('never throws, even for nonsense overrides', () => {

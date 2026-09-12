@@ -22,6 +22,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 import { DEFAULT_MODEL, loadConfig, type ZooConfig } from '../lib/config.js'
+import type { ContextBudgetOptions, ContextStats } from '../lib/context-budget.js'
 import { runDoctor } from '../lib/doctor.js'
 import { loadDotenv } from '../lib/dotenv.js'
 import { getProjectSummary } from '../lib/files.js'
@@ -99,15 +100,58 @@ function mockProbeCommand(req: LlmRequest): string | undefined {
 }
 
 /**
+ * Task prefix for a multi-step, large-output probe: `mock-long: 3` asks the
+ * mock to issue three `read_file` calls on a big tracked repo file and then
+ * finish. It exists so the hermetic CLI tests can exercise the REAL
+ * context-budget path offline: the transcript quickly exceeds a small
+ * `--context-budget`, so a step genuinely prunes. A normal prompt never matches,
+ * so ordinary `--mock` runs are unchanged.
+ */
+const MOCK_LONG_PREFIX = 'mock-long:'
+
+/** The tracked file the probe reads; big enough to be truncated at 40k chars. */
+const MOCK_LONG_FILE = 'package-lock.json'
+
+/** How many large reads a `mock-long: <n>` task asks for (default 1, min 1). */
+function mockLongRounds(req: LlmRequest): number | undefined {
+  const firstUser = req.messages.find((message) => message.role === 'user')
+  const content = typeof firstUser?.content === 'string' ? firstUser.content : ''
+  if (!content.startsWith(MOCK_LONG_PREFIX)) return undefined
+  const raw = content.slice(MOCK_LONG_PREFIX.length).trim()
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
+}
+
+/**
  * Scripted client for `--mock` one-shot runs.
  *
  * - normal task → the canned {@link MOCK_AGENT_RESPONSES} text (unchanged)
  * - `mock-run: <command>` → ask the harness to run `<command>` once, then echo
  *   the tool's report back as the final answer
+ * - `mock-long: <n>` → issue `<n>` large `read_file` calls, then answer
  */
 function createMockAgentClient(): LlmClient {
   let probeIssued = false
+  // Counted in the closure, NOT derived from the transcript: the outbound
+  // transcript may have had groups pruned away, and progress must not depend on
+  // what survived pruning.
+  let longIssued = 0
   return createMockLlmClient((req: LlmRequest): LlmResponse => {
+    const longRounds = mockLongRounds(req)
+    if (longRounds !== undefined) {
+      if (longIssued < longRounds) {
+        const index = longIssued
+        longIssued += 1
+        return {
+          content: null,
+          toolCalls: [
+            { id: `mock-long-${index}`, name: 'read_file', args: { path: MOCK_LONG_FILE } },
+          ],
+        }
+      }
+      return { content: `mock-long: read ${MOCK_LONG_FILE} ${longIssued} time(s)` }
+    }
+
     const command = mockProbeCommand(req)
     if (command !== undefined && !probeIssued) {
       probeIssued = true
@@ -193,6 +237,44 @@ function flagNumber(parsed: ParsedArgs, name: string): number | undefined {
   const value = Number(raw)
   if (!Number.isFinite(value)) throw new Error(`${name} must be a number`)
   return value
+}
+
+/* -------------------------------------------------------------------------- */
+/* Context budget wiring                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolve the `contextBudget` handed to `runAgent` from the flags first, then
+ * the config env vars. Returns `undefined` when neither is set so the library
+ * default (`DEFAULT_CONTEXT_BUDGET`) applies.
+ *
+ * `--context-budget` sets the estimated-token ceiling; `--keep-recent` sets how
+ * many trailing message groups stay verbatim.
+ */
+function contextBudgetFrom(
+  parsed: ParsedArgs,
+  config?: ZooConfig,
+): Partial<ContextBudgetOptions> | undefined {
+  const budgetTokens = flagNumber(parsed, '--context-budget') ?? config?.contextBudgetTokens
+  const keepRecentGroups = flagNumber(parsed, '--keep-recent') ?? config?.contextKeepGroups
+  if (budgetTokens === undefined && keepRecentGroups === undefined) return undefined
+
+  const budget: Partial<ContextBudgetOptions> = {}
+  if (budgetTokens !== undefined) budget.budgetTokens = budgetTokens
+  if (keepRecentGroups !== undefined) budget.keepRecentGroups = keepRecentGroups
+  return budget
+}
+
+/**
+ * One compact line describing what the budget did. Written to **stderr** so
+ * `--json` payloads on stdout stay machine-readable. Token counts are
+ * estimates, hence the `est.` marker.
+ */
+function formatContextLine(stats: ContextStats): string {
+  return (
+    `[context] pruned: ${stats.originalTokens} -> ${stats.finalTokens} est. tokens ` +
+    `(${stats.elidedResults} results elided, ${stats.droppedGroups} groups dropped)`
+  )
 }
 
 /* -------------------------------------------------------------------------- */
@@ -452,6 +534,12 @@ function describeEvent(event: AgentEvent): string {
   switch (event.type) {
     case 'llm_request':
       return `[step ${event.step}] → llm_request (${event.messageCount} messages)`
+    case 'context_pruned':
+      return (
+        `[step ${event.step}] context pruned: ${event.stats.originalTokens} -> ` +
+        `${event.stats.finalTokens} est. tokens (${event.stats.elidedResults} results elided, ` +
+        `${event.stats.droppedGroups} groups dropped)`
+      )
     case 'llm_response':
       return `[step ${event.step}] ← llm_response (content=${event.content === null ? 'null' : 'set'}, toolCalls=${event.toolCallCount})`
     case 'tool_call':
@@ -489,13 +577,20 @@ function cmdTools(args: string[]): number {
   return 0
 }
 
-/** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--mock] [--json] [--events] [--exec-policy <mode>]` */
+/** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]` */
 async function cmdAgent(args: string[]): Promise<number> {
-  const parsed = parseArgs(args, ['--system', '--max-steps', '--cwd', '--exec-policy'])
+  const parsed = parseArgs(args, [
+    '--system',
+    '--max-steps',
+    '--cwd',
+    '--exec-policy',
+    '--context-budget',
+    '--keep-recent',
+  ])
   const task = parsed.positionals[0]
   if (task === undefined) {
     logger.error('agent requires a task prompt')
-    logger.dim('usage: zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--mock] [--json] [--events] [--exec-policy <mode>]')
+    logger.dim('usage: zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]')
     return 1
   }
 
@@ -527,6 +622,8 @@ async function cmdAgent(args: string[]): Promise<number> {
   if (effectiveMaxSteps !== undefined) options.maxSteps = effectiveMaxSteps
   if (cwd !== undefined) options.cwd = cwd
   if (config?.model !== undefined) options.model = config.model
+  const contextBudget = contextBudgetFrom(parsed, config)
+  if (contextBudget !== undefined) options.contextBudget = contextBudget
   if (streamEvents) {
     options.onEvent = (event: AgentEvent): void => {
       process.stderr.write(`${describeEvent(event)}\n`)
@@ -535,6 +632,13 @@ async function cmdAgent(args: string[]): Promise<number> {
 
   const startedAt = Date.now()
   const result = await runAgent(options)
+
+  // At least one step pruned its outbound transcript: report it on stderr so the
+  // JSON payload on stdout stays clean.
+  if (result.context !== undefined) {
+    process.stderr.write(`${formatContextLine(result.context)}\n`)
+  }
+
   persistUsage({
     kind: 'agent',
     model: config?.model ?? DEFAULT_MODEL,
@@ -548,7 +652,14 @@ async function cmdAgent(args: string[]): Promise<number> {
   if (asJson) {
     console.log(
       JSON.stringify(
-        { ok: result.ok, final: result.final, steps: result.steps, error: result.error ?? null },
+        {
+          ok: result.ok,
+          final: result.final,
+          steps: result.steps,
+          error: result.error ?? null,
+          // Last applied stats, or null when nothing was pruned.
+          context: result.context ?? null,
+        },
         null,
         2,
       ),
@@ -563,9 +674,9 @@ async function cmdAgent(args: string[]): Promise<number> {
   return result.ok ? 0 : 1
 }
 
-/** `zoocode chat [--mock] [--system <text>] [--exec-policy <mode>]` */
+/** `zoocode chat [--mock] [--system <text>] [--context-budget <tokens>] [--keep-recent <n>] [--exec-policy <mode>]` */
 async function cmdChat(args: string[]): Promise<number> {
-  const parsed = parseArgs(args, ['--system', '--exec-policy'])
+  const parsed = parseArgs(args, ['--system', '--exec-policy', '--context-budget', '--keep-recent'])
   const mock = flagEnabled(parsed, '--mock')
   const system = flagValue(parsed, '--system')
 
@@ -596,6 +707,7 @@ async function cmdChat(args: string[]): Promise<number> {
   // ONE transcript for the whole session; each turn extends it.
   let transcript: ChatMessage[] = system === undefined ? [] : [{ role: 'system', content: system }]
   const maxSteps = config?.maxSteps ?? DEFAULT_MAX_STEPS
+  const contextBudget = contextBudgetFrom(parsed, config)
 
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   const buffered: string[] = []
@@ -678,12 +790,20 @@ async function cmdChat(args: string[]): Promise<number> {
         maxSteps,
       }
       if (config?.model !== undefined) options.model = config.model
+      if (contextBudget !== undefined) options.contextBudget = contextBudget
 
       const result = await runAgent(options)
-      // Adopt the returned transcript so history accumulates across turns.
+      // Adopt the returned transcript so history accumulates across turns. The
+      // context budget only shrank the OUTBOUND request, so the stored history
+      // stays complete.
       transcript = result.messages
       chatSteps += result.steps
       if (!result.ok) chatOk = false
+
+      // Per-turn note on stderr (stdout carries the reply).
+      if (result.context !== undefined) {
+        process.stderr.write(`${formatContextLine(result.context)}\n`)
+      }
 
       if (result.ok) console.log(result.final.length > 0 ? result.final : '(no final text)')
       else logger.error(result.error ?? 'agent run failed')
@@ -705,9 +825,14 @@ async function cmdChat(args: string[]): Promise<number> {
   return 0
 }
 
-/** `zoocode run <file.json | -> [--concurrency N] [--mock] [--json]` */
+/** `zoocode run <file.json | -> [--concurrency N] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json]` */
 async function cmdRun(args: string[]): Promise<number> {
-  const parsed = parseArgs(args, ['--concurrency', '--exec-policy'])
+  const parsed = parseArgs(args, [
+    '--concurrency',
+    '--exec-policy',
+    '--context-budget',
+    '--keep-recent',
+  ])
   const source = parsed.positionals[0]
   if (source === undefined) {
     logger.error('run requires a JSON file path or "-" for stdin')
@@ -746,12 +871,14 @@ async function cmdRun(args: string[]): Promise<number> {
   const recorder = withUsageRecording(llm)
 
   const concurrency = flagNumber(parsed, '--concurrency') ?? config?.concurrency
+  const contextBudget = contextBudgetFrom(parsed, config)
 
   const startedAt = Date.now()
   const result = await runParallel(tasks, {
     llm: recorder.llm,
     tools: createCoreTools({ policy: policyResult.policy }),
     ...(concurrency !== undefined ? { concurrency } : {}),
+    ...(contextBudget !== undefined ? { contextBudget } : {}),
   })
   persistUsage({
     kind: 'parallel',
@@ -762,6 +889,13 @@ async function cmdRun(args: string[]): Promise<number> {
     label: tasks.length === 1 ? tasks[0].prompt : `${tasks.length} sub-tasks`,
     recorder,
   })
+
+  // One compact stderr line per sub-task that pruned (stdout stays clean).
+  for (const entry of result.results) {
+    if (entry.result.context !== undefined) {
+      process.stderr.write(`${formatContextLine(entry.result.context)}\n`)
+    }
+  }
 
   if (asJson) {
     console.log(JSON.stringify(result, null, 2))
@@ -1154,9 +1288,9 @@ const USAGE = `
 
   Usage:
     zoocode tools [--json]
-    zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--mock] [--json] [--events] [--exec-policy <mode>] [--allow-exec] [--no-exec]
-    zoocode chat [--mock] [--system <text>] [--exec-policy <mode>] [--allow-exec] [--no-exec]
-    zoocode run <file.json | -> [--concurrency N] [--mock] [--json] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+    zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+    zoocode chat [--mock] [--system <text>] [--context-budget <tokens>] [--keep-recent <n>] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+    zoocode run <file.json | -> [--concurrency N] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--exec-policy <mode>] [--allow-exec] [--no-exec]
     zoocode doctor [--json]
     zoocode analyze <dir> [--json]
     zoocode search <pattern> [--ext .ts] [--max N] [--project <name>] [--json]
@@ -1184,6 +1318,24 @@ const USAGE = `
     --mock      Use a scripted mock LLM (no API key required)
     --json      Emit machine-readable JSON
     --events    Stream agent events to stderr (agent only)
+
+  Context management for agent / chat / run:
+    The loop re-sends the whole transcript every step, so before each request the
+    outbound transcript is bounded (the transcript RETURNED to you is untouched).
+    Pruning works on whole message groups — an assistant message with toolCalls
+    plus all of its tool results travel together, always: a long tool result is
+    elided oldest-first (its content replaced by a short marker, the message and
+    its toolCallId stay), and only if that is not enough are whole groups dropped
+    oldest-first. The system prompt, the first user task and the most recent
+    groups are never elided and never dropped.
+    --context-budget <tokens>  Estimated-token ceiling per request (default 48000)
+    --keep-recent <n>          Most recent groups kept verbatim (default 6)
+    Environment:               ZOO_CONTEXT_BUDGET_TOKENS / ZOO_CONTEXT_KEEP_GROUPS
+
+    Token counts are ESTIMATES (chars/4), not exact counts. When a step prunes,
+    one compact "[context] pruned: <before> -> <after> est. tokens (…)" line is
+    written to stderr, and --json includes the last applied stats under
+    "context" (null when nothing was pruned).
 
   Usage tracking (agent / chat / run):
     Token usage from each real run is appended to .zoo/usage.jsonl (gitignored).

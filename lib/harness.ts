@@ -24,6 +24,8 @@ import type {
   ToolContext,
   ToolResult,
 } from './types.js'
+import type { ContextStats } from './context-budget.js'
+import { applyContextBudget, DEFAULT_CONTEXT_BUDGET } from './context-budget.js'
 import { executeTool } from './tools.js'
 import { DEFAULT_MAX_STEPS, DEFAULT_MODEL } from './config.js'
 
@@ -105,6 +107,9 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
   // transcript and step count, even when the input itself is malformed.
   let messages: ChatMessage[] = []
   let steps = 0
+  // Stats of the MOST RECENT step that pruned, surfaced on the result so callers
+  // can report what the budget did without replaying the event stream.
+  let contextStats: ContextStats | undefined
 
   /** Emit an event, swallowing observer faults so the loop always survives. */
   const emit = (event: AgentEvent): void => {
@@ -119,12 +124,22 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
 
   const fail = (error: string, stepsTaken: number): RunAgentResult => {
     emit({ type: 'error', step: stepsTaken, error })
-    return { ok: false, messages, final: finalText(messages), steps: stepsTaken, error }
+    const result: RunAgentResult = {
+      ok: false,
+      messages,
+      final: finalText(messages),
+      steps: stepsTaken,
+      error,
+    }
+    if (contextStats !== undefined) result.context = contextStats
+    return result
   }
 
   const succeed = (stepsTaken: number, final: string): RunAgentResult => {
     emit({ type: 'done', steps: stepsTaken, final })
-    return { ok: true, messages, final, steps: stepsTaken }
+    const result: RunAgentResult = { ok: true, messages, final, steps: stepsTaken }
+    if (contextStats !== undefined) result.context = contextStats
+    return result
   }
 
   try {
@@ -142,7 +157,17 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
 
       emit({ type: 'llm_request', step, messageCount: messages.length })
 
-      const request: LlmRequest = { model, messages }
+      // Bound the OUTBOUND transcript only. `messages` — and therefore the
+      // transcript returned to the caller — keeps the full history. Pruning is
+      // group-aware (see `lib/context-budget.ts`) so the assistant `toolCalls`
+      // / `tool` result pairing stays valid on the wire.
+      const pruned = applyContextBudget(messages, options?.contextBudget ?? DEFAULT_CONTEXT_BUDGET)
+      if (pruned.stats.pruned) {
+        contextStats = pruned.stats
+        emit({ type: 'context_pruned', step, stats: pruned.stats })
+      }
+
+      const request: LlmRequest = { model, messages: pruned.messages }
       if (tools.length > 0) request.tools = tools
       if (options?.signal) request.signal = options.signal
 

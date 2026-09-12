@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { estimateMessagesTokens } from '../lib/context-budget.js'
 import {
   DEFAULT_MAX_STEPS,
   createMessages,
@@ -508,5 +509,137 @@ describe('runAgent', () => {
 
   it('exposes DEFAULT_MAX_STEPS as 25', () => {
     expect(DEFAULT_MAX_STEPS).toBe(25)
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* runAgent + context budget                                                  */
+/* -------------------------------------------------------------------------- */
+
+describe('runAgent — context budget', () => {
+  /** Deterministic tool returning a large payload, to force pruning. */
+  function bigTool(chars: number): ToolDef {
+    return {
+      name: 'big',
+      description: 'Return a large payload.',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => ({ ok: true, content: 'y'.repeat(chars) }),
+    }
+  }
+
+  /**
+   * Return one string per assistant-with-toolCalls message that is not answered
+   * by the immediately-following `tool` messages (the DeepSeek wire rule).
+   */
+  function pairingViolations(messages: ChatMessage[]): string[] {
+    const violations: string[] = []
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]
+      if (!message || message.role !== 'assistant') continue
+      const calls = message.toolCalls
+      if (!Array.isArray(calls) || calls.length === 0) continue
+
+      const answered = new Set<string>()
+      let next = index + 1
+      while (next < messages.length && messages[next]?.role === 'tool') {
+        const id = messages[next].toolCallId
+        if (typeof id === 'string') answered.add(id)
+        next += 1
+      }
+      for (const call of calls) {
+        if (!answered.has(call.id)) violations.push(`message ${index}: ${call.id} unanswered`)
+      }
+    }
+    return violations
+  }
+
+  it('prunes the OUTBOUND transcript while returning the FULL history', async () => {
+    const rounds = 6
+    const resultChars = 4_000
+    let step = 0
+    const seen: LlmRequest[] = []
+    const llm: LlmClient = {
+      chat: async (req) => {
+        seen.push(req)
+        step += 1
+        if (step <= rounds) {
+          return { content: null, toolCalls: [{ id: `call-${step}`, name: 'big', args: {} }] }
+        }
+        return { content: 'finished' }
+      },
+    }
+    const events: AgentEvent[] = []
+
+    const result = await runAgent({
+      llm,
+      tools: [bigTool(resultChars)],
+      messages: user('go'),
+      maxSteps: 12,
+      contextBudget: { budgetTokens: 3_000, keepRecentGroups: 1 },
+      onEvent: (event) => events.push(event),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.final).toBe('finished')
+
+    // (i) The transcript handed to a LATER llm.chat is smaller than the full one.
+    const lastRequest = seen.at(-1) as LlmRequest
+    expect(estimateMessagesTokens(lastRequest.messages)).toBeLessThan(
+      estimateMessagesTokens(result.messages),
+    )
+    // ...and the pruned request is still wire-valid (pairing invariant).
+    expect(pairingViolations(lastRequest.messages)).toEqual([])
+
+    // (ii) `context_pruned` fired with plausible stats.
+    const prunedEvents = events.filter((event) => event.type === 'context_pruned')
+    expect(prunedEvents.length).toBeGreaterThan(0)
+    const firstPruned = prunedEvents[0]
+    if (firstPruned.type !== 'context_pruned') throw new Error('unreachable')
+    expect(firstPruned.stats.originalTokens).toBeGreaterThan(firstPruned.stats.finalTokens)
+    expect(firstPruned.stats.pruned).toBe(true)
+    expect(firstPruned.step).toBeGreaterThanOrEqual(1)
+    expect(result.context?.pruned).toBe(true)
+    expect(result.context?.elidedResults).toBeGreaterThan(0)
+
+    // (iii) The transcript RETURNED to the caller is still the full one.
+    expect(result.messages).toHaveLength(1 + rounds * 2 + 1)
+    const returnedToolMessages = result.messages.filter((message) => message.role === 'tool')
+    expect(returnedToolMessages).toHaveLength(rounds)
+    for (const message of returnedToolMessages) {
+      expect(message.content).toHaveLength(resultChars)
+    }
+  })
+
+  it('emits no context_pruned event when the transcript fits the budget', async () => {
+    const events: AgentEvent[] = []
+    const result = await runAgent({
+      llm: createMockLlmClient([{ content: 'ok' }]),
+      tools: [],
+      messages: user('hi'),
+      onEvent: (event) => events.push(event),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(events.some((event) => event.type === 'context_pruned')).toBe(false)
+    expect(result.context).toBeUndefined()
+  })
+
+  it('never mutates the caller transcript even when pruning', async () => {
+    const input = user('go')
+    const snapshot = JSON.stringify(input)
+
+    const result = await runAgent({
+      llm: createMockLlmClient([
+        { content: null, toolCalls: [{ id: 'c1', name: 'big', args: {} }] },
+        { content: 'done' },
+      ]),
+      tools: [bigTool(4_000)],
+      messages: input,
+      contextBudget: { budgetTokens: 100, keepRecentGroups: 1 },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(JSON.stringify(input)).toBe(snapshot)
+    expect(input).toHaveLength(1)
   })
 })

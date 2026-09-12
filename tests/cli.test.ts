@@ -284,6 +284,90 @@ describe.skipIf(!cliAvailable)('zoocode CLI smoke tests', () => {
   )
 
   it(
+    '`help` documents the context budget flags and the estimate caveat',
+    () => {
+      // Reuse the collection-time probe instead of spawning a second time.
+      expectExit(probe, 0)
+      expect(probe.stdout).toContain('--context-budget <tokens>')
+      expect(probe.stdout).toContain('--keep-recent <n>')
+      expect(probe.stdout).toContain('ZOO_CONTEXT_BUDGET_TOKENS')
+      expect(probe.stdout).toContain('ZOO_CONTEXT_KEEP_GROUPS')
+      // Token counts are estimates, and that is said out loud.
+      expect(probe.stdout).toContain('ESTIMATES')
+    },
+    TIMEOUT_MS,
+  )
+
+  it(
+    '`agent --mock --json` accepts the context flags and reports context:null when nothing pruned',
+    () => {
+      const result = runCli([
+        'agent',
+        'say hello',
+        '--mock',
+        '--json',
+        '--context-budget',
+        '5000',
+        '--keep-recent',
+        '1',
+      ])
+      expectExit(result, 0)
+      const parsed = JSON.parse(result.stdout) as { ok: boolean; context: unknown }
+      expect(parsed.ok).toBe(true)
+      // Nothing was pruned (a two-message transcript), so the stats are null...
+      expect(parsed.context).toBeNull()
+      // ...and no `[context] pruned:` line is written to stderr.
+      expect(result.stderr).not.toContain('[context] pruned:')
+    },
+    TIMEOUT_MS,
+  )
+
+  it(
+    'a step that prunes reports it on stderr and in --json (mock-long probe)',
+    () => {
+      // `mock-long: 3` reads a large tracked file three times, so the transcript
+      // far exceeds the tiny budget and a step genuinely prunes — all offline.
+      const result = runCli([
+        'agent',
+        'mock-long: 3',
+        '--mock',
+        '--json',
+        '--context-budget',
+        '6000',
+        '--keep-recent',
+        '1',
+      ])
+      expectExit(result, 0)
+
+      const parsed = JSON.parse(result.stdout) as {
+        ok: boolean
+        final: string
+        context: {
+          pruned: boolean
+          originalTokens: number
+          finalTokens: number
+          elidedResults: number
+          droppedGroups: number
+        } | null
+      }
+      expect(parsed.ok).toBe(true)
+      expect(parsed.final).toContain('mock-long: read package-lock.json')
+      expect(parsed.context).not.toBeNull()
+      expect(parsed.context?.pruned).toBe(true)
+      expect(parsed.context?.originalTokens).toBeGreaterThan(parsed.context?.finalTokens ?? 0)
+      expect(
+        (parsed.context?.elidedResults ?? 0) > 0 || (parsed.context?.droppedGroups ?? 0) > 0,
+      ).toBe(true)
+
+      // The compact summary is on STDERR; stdout stays clean for --json.
+      expect(result.stderr).toContain('[context] pruned:')
+      expect(result.stderr).toMatch(/est\. tokens \(\d+ results elided, \d+ groups dropped\)/)
+      expect(result.stdout).not.toContain('[context] pruned:')
+    },
+    TIMEOUT_MS,
+  )
+
+  it(
     '`help` documents `improve`, its warning, and its flags',
     () => {
       // Reuse the collection-time probe instead of spawning a second time.

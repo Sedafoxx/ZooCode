@@ -18,6 +18,7 @@
 
 import { createMessages, runAgent } from './harness.js'
 import { DEFAULT_CONCURRENCY } from './config.js'
+import type { ContextBudgetOptions } from './context-budget.js'
 import type {
   AgentEvent,
   LlmClient,
@@ -43,6 +44,8 @@ export interface RunParallelOptions {
   concurrency?: number
   signal?: AbortSignal
   onTaskEvent?: (taskId: string, event: unknown) => void
+  /** Per-task context budget, forwarded verbatim to every `runAgent` call. */
+  contextBudget?: Partial<ContextBudgetOptions>
 }
 
 export interface SubTaskResult {
@@ -120,6 +123,7 @@ async function runSubTask(task: SubTask, options: RunParallelOptions): Promise<S
   if (options.maxSteps !== undefined) runOptions.maxSteps = options.maxSteps
   if (options.cwd !== undefined) runOptions.cwd = options.cwd
   if (options.signal) runOptions.signal = options.signal
+  if (options.contextBudget !== undefined) runOptions.contextBudget = options.contextBudget
 
   const onTaskEvent = options.onTaskEvent
   if (onTaskEvent) {
