@@ -431,18 +431,26 @@ function guardCommand(tool: ToolDef, root: string): ToolDef {
   }
 }
 
+/** The exact-block edit tool; guarded exactly like `write_file`. */
+const EDIT_TOOL = 'edit_file'
+
 /**
  * Return a copy of `tools` in which every file-mutating / shell tool is confined
- * to `root`. `write_file` is path-checked against the repository root and the
- * protected-path denylist; `run_command` keeps its policy gate (applied by the
- * caller via `createCoreTools({ policy })`) and is additionally barred from
- * running outside `root`. Every other tool is returned untouched.
+ * to `root`. `write_file` and `edit_file` are path-checked against the
+ * repository root and the protected-path denylist; `run_command` keeps its
+ * policy gate (applied by the caller via `createCoreTools({ policy })`) and is
+ * additionally barred from running outside `root`. Every other tool is returned
+ * untouched.
+ *
+ * edit_file is guarded for the same reason write_file is: it carries a `path`
+ * and mutates a file, so leaving it unguarded would have handed the
+ * self-improvement loop an unconfined way to rewrite anything on disk.
  */
 export function guardTools(tools: ToolDef[], root: string): ToolDef[] {
   if (!Array.isArray(tools)) return []
   const repoRoot = resolve(root)
   return tools.map((tool) => {
-    if (tool?.name === WRITE_TOOL) return guardWrite(tool, repoRoot)
+    if (tool?.name === WRITE_TOOL || tool?.name === EDIT_TOOL) return guardWrite(tool, repoRoot)
     if (tool?.name === RUN_TOOL) return guardCommand(tool, repoRoot)
     return tool
   })

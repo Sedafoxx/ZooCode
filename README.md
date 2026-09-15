@@ -81,7 +81,7 @@ L3  Sub-agents     lib/subagent.ts       runParallel · worker pool · tool scop
 L2  Harness        lib/harness.ts        runAgent · the agentic loop · events
      │
 L1  LLM + Tools    lib/llm.ts            LlmClient seam (DeepSeek + mock)
-                   lib/tools.ts          ToolDef registry (8 core tools)
+                   lib/tools.ts          ToolDef registry (9 core tools)
                    lib/policy.ts         execution policy (deny patterns · modes)
      │
 L0  Contract       lib/types.ts          ChatMessage · ToolDef · AgentEvent · …
@@ -140,6 +140,22 @@ zoocode help
   `run`, bound the transcript handed to the model (see
   [Context management](#context-management)). With no flag the CLI uses
   `ZOO_CONTEXT_BUDGET_TOKENS` / `ZOO_CONTEXT_KEEP_GROUPS`, else the defaults.
+- `--verify-cmd "<cmd>"` — on `agent`, run a verification command **after** the
+  loop. A non-zero exit fails the whole run (`exit 1`), prints a tail of the
+  output, and is recorded in `--json` as `verify`. [`improve`](#improving-itself)
+  has always had a mandatory gate; a plain agent run had none, which is how a
+  migration could be written and reported done without ever being applied.
+- **Step-budget steering** applies to `agent` and `run`, not only `improve`: at
+  60% and 85% of `--max-steps` one reminder is appended to the outbound request
+  telling the model to stop checking and finish. Without it, a run that gets stuck
+  repeating the same check spends the whole budget first (one observed run burned
+  26 CPU-minutes looping on `tsc` and `next build`).
+- **A default system prompt** now ships with `agent` (see
+  [`AGENT_SYSTEM_PROMPT`](bin/zoocode.ts)). It exists because every failure this
+  harness hit was avoidable in prose: prefer `edit_file` over `write_file` for
+  existing files, never improvise scratch scripts to patch source, never report
+  success the output does not support, and do not re-run a command that passed.
+  Pass `--system` to override it.
 - `commit` / `scaffold` — passthroughs that spawn the existing
   [`scripts/commit.ts`](scripts/commit.ts) / [`scripts/scaffold.ts`](scripts/scaffold.ts)
   with inherited stdio.
@@ -153,6 +169,7 @@ exits `0` when healthy; unknown commands exit `1`.
 | --- | --- |
 | `read_file` | Read a UTF-8 file (relative to `cwd`, truncated). |
 | `write_file` | Write a UTF-8 file, creating parent directories. |
+| `edit_file` | Replace one exact block of text in an existing file. **Prefer this over `write_file` for changes to existing files** — it sends only the changed part, so the rest of the file cannot be truncated. Refuses when the search text is missing, and refuses an ambiguous match unless `all` is true. |
 | `list_files` | List a directory, optionally recursive. |
 | `search_files` | Regex-search projects → `project/file:line: text`. |
 | `run_command` | Run a shell command, gated by the execution policy (see [Execution safety](#execution-safety)). |

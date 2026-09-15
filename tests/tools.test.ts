@@ -7,6 +7,7 @@ import { createExecPolicy } from '../lib/policy.js'
 import type { ToolContext, ToolDef, ToolResult } from '../lib/types.js'
 
 const EXPECTED_TOOLS = [
+  'edit_file',
   'finish',
   'list_files',
   'read_file',
@@ -32,8 +33,8 @@ afterEach(() => {
 })
 
 describe('createCoreTools', () => {
-  it('returns the 8 built-in tools', () => {
-    expect(tools).toHaveLength(8)
+  it('returns the 9 built-in tools', () => {
+    expect(tools).toHaveLength(9)
     expect(tools.map((tool) => tool.name).sort()).toEqual(EXPECTED_TOOLS)
   })
 
@@ -60,7 +61,7 @@ describe('getTool', () => {
 describe('toolSummaries', () => {
   it('returns a name/description pair per tool', () => {
     const summaries = toolSummaries(tools)
-    expect(summaries).toHaveLength(8)
+    expect(summaries).toHaveLength(9)
     expect(summaries.every((entry) => entry.name.length > 0 && entry.description.length > 0)).toBe(true)
   })
 })
@@ -210,6 +211,106 @@ describe('run_command', () => {
   })
 })
 
+describe('edit_file', () => {
+  it('replaces one exact block and leaves the rest of the file intact', async () => {
+    const before = 'export const a = 1\nexport const b = 2\nexport const c = 3\n'
+    await executeTool(tools, 'write_file', { path: 'lib/mod.ts', content: before }, ctx)
+
+    const result = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'lib/mod.ts', search: 'export const b = 2', replace: 'export const b = 20' },
+      ctx,
+    )
+
+    expect(result.ok).toBe(true)
+    expect(result.content).toContain('replaced 1 occurrence')
+    // The point of the tool: everything else survives untouched.
+    expect(readFileSync(join(dir, 'lib/mod.ts'), 'utf-8')).toBe(
+      'export const a = 1\nexport const b = 20\nexport const c = 3\n',
+    )
+  })
+
+  it('refuses when the search text is not found, instead of writing nothing quietly', async () => {
+    await executeTool(tools, 'write_file', { path: 'a.ts', content: 'const x = 1\n' }, ctx)
+
+    const result = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'a.ts', search: 'const y = 2', replace: 'const y = 3' },
+      ctx,
+    )
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('was not found')
+    expect(readFileSync(join(dir, 'a.ts'), 'utf-8')).toBe('const x = 1\n')
+  })
+
+  it('refuses an ambiguous match rather than editing the wrong one', async () => {
+    await executeTool(tools, 'write_file', { path: 'dup.ts', content: 'let n = 0\nlet n = 0\n' }, ctx)
+
+    const ambiguous = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'dup.ts', search: 'let n = 0', replace: 'let n = 1' },
+      ctx,
+    )
+    expect(ambiguous.ok).toBe(false)
+    expect(ambiguous.error).toContain('appears 2 times')
+    expect(readFileSync(join(dir, 'dup.ts'), 'utf-8')).toBe('let n = 0\nlet n = 0\n')
+
+    const all = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'dup.ts', search: 'let n = 0', replace: 'let n = 1', all: true },
+      ctx,
+    )
+    expect(all.ok).toBe(true)
+    expect(all.content).toContain('replaced 2 occurrences')
+    expect(readFileSync(join(dir, 'dup.ts'), 'utf-8')).toBe('let n = 1\nlet n = 1\n')
+  })
+
+  it('points at write_file when the file does not exist', async () => {
+    const result = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'missing.ts', search: 'a', replace: 'b' },
+      ctx,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('write_file')
+  })
+
+  it('treats $ sequences in the replacement literally', async () => {
+    // String.replace() would treat "$&" as a backreference; split/join must not.
+    await executeTool(tools, 'write_file', { path: 'dollar.ts', content: 'MARK\n' }, ctx)
+
+    const result = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'dollar.ts', search: 'MARK', replace: '$& and $1 stay literal' },
+      ctx,
+    )
+
+    expect(result.ok).toBe(true)
+    expect(readFileSync(join(dir, 'dollar.ts'), 'utf-8')).toBe('$& and $1 stay literal\n')
+  })
+
+  it('explains a CRLF mismatch instead of just failing', async () => {
+    await executeTool(tools, 'write_file', { path: 'crlf.ts', content: 'a\r\nb\r\n' }, ctx)
+
+    const result = await executeTool(
+      tools,
+      'edit_file',
+      { path: 'crlf.ts', search: 'a\nb', replace: 'c' },
+      ctx,
+    )
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('CRLF')
+  })
+})
+
 describe('createCoreTools({ allowExec })', () => {
   it('refuses to spawn commands when allowExec is false', async () => {
     const noExec = createCoreTools({ allowExec: false })
@@ -224,8 +325,8 @@ describe('createCoreTools({ allowExec })', () => {
     expect(result.ok).toBe(true)
   })
 
-  it('still exposes all 8 tools when exec is disabled', () => {
-    expect(createCoreTools({ allowExec: false })).toHaveLength(8)
+  it('still exposes all 9 tools when exec is disabled', () => {
+    expect(createCoreTools({ allowExec: false })).toHaveLength(9)
   })
 })
 
@@ -335,7 +436,7 @@ describe('run_command with an execution policy', () => {
     expect(result.error).toBe('Command execution is disabled (allowExec=false)')
   })
 
-  it('still exposes all 8 tools with a policy attached', () => {
-    expect(createCoreTools({ policy: createExecPolicy({ mode: 'deny' }) })).toHaveLength(8)
+  it('still exposes all 9 tools with a policy attached', () => {
+    expect(createCoreTools({ policy: createExecPolicy({ mode: 'deny' }) })).toHaveLength(9)
   })
 })

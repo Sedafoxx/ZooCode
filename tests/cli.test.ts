@@ -36,6 +36,7 @@ const TIMEOUT_MS = 120_000
 const CORE_TOOL_NAMES = [
   'read_file',
   'write_file',
+  'edit_file',
   'list_files',
   'search_files',
   'run_command',
@@ -127,11 +128,11 @@ function expectExit(result: CliResult, code: number): void {
 
 describe.skipIf(!cliAvailable)('zoocode CLI smoke tests', () => {
   it(
-    '`tools` exits 0 and lists the 8 core tools',
+    '`tools` exits 0 and lists the 9 core tools',
     () => {
       const result = runCli(['tools'])
       expectExit(result, 0)
-      expect(result.stdout).toContain('Core tools (8)')
+      expect(result.stdout).toContain('Core tools (9)')
       for (const name of CORE_TOOL_NAMES) {
         expect(result.stdout).toContain(name)
       }
@@ -142,7 +143,7 @@ describe.skipIf(!cliAvailable)('zoocode CLI smoke tests', () => {
       const json = runCli(['tools', '--json'])
       expectExit(json, 0)
       const parsed = JSON.parse(json.stdout) as { name: string }[]
-      expect(parsed).toHaveLength(8)
+      expect(parsed).toHaveLength(9)
       expect(parsed.map((entry) => entry.name).sort()).toEqual([...CORE_TOOL_NAMES].sort())
     },
     TIMEOUT_MS,

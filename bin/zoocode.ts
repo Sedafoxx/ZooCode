@@ -31,6 +31,7 @@ import {
   DEFAULT_IMPROVE_MAX_STEPS,
   DEFAULT_VERIFY_COMMAND,
   runImprovement,
+  createSteeringLlmClient,
 } from '../lib/improve.js'
 import { createDeepSeekClient, createMockLlmClient } from '../lib/llm.js'
 import * as logger from '../lib/logger.js'
@@ -577,12 +578,45 @@ function cmdTools(args: string[]): number {
   return 0
 }
 
-/** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]` */
+/**
+ * Default system prompt for a plain `agent` run.
+ *
+ * Every failure this harness actually hit was avoidable in prose: rewriting a
+ * whole file to change one line (which came back truncated), improvising scratch
+ * scripts to patch source because no edit tool existed, re-running the same check
+ * until the budget ran out, and calling the task done without ever running the
+ * verification it had been given.
+ */
+const AGENT_SYSTEM_PROMPT = [
+  'You are a coding agent working inside a repository. Inspect the files you change and never invent their contents.',
+  '',
+  'Editing files:',
+  '- To change a file that ALREADY EXISTS, use `edit_file` with an exact search/replace block. Do NOT use `write_file` to change part of an existing file: regenerating a large file is how content gets truncated and lost.',
+  '- Use `write_file` only to create a NEW file.',
+  '- Keep each edit proportional to the change you are making.',
+  '',
+  'Working style:',
+  '- Be surgical: change only what the task asks for, and preserve everything else.',
+  '- Never create scratch or helper files (no .py, .mjs, .sh, no temporary patch scripts) to do work a tool can do. If you catch yourself generating source code inside a script, stop and use edit_file or write_file instead.',
+  '- Do not browse the repository. Read only the files you need.',
+  '- Run the verification command before claiming success, and never report success the output does not support.',
+  '- If a command has already passed, do not run it again.',
+  '- When the task is done, call `finish` with a short summary of what changed.',
+].join('\n')
+
+/** Last `count` non-empty lines of output, for a failure tail. */
+function lastLines(output: string, count: number): string {
+  const lines = output.split(/\r?\n/).filter((line) => line.trim().length > 0)
+  return lines.slice(Math.max(0, lines.length - count)).join('\n')
+}
+
+/** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--verify-cmd "<cmd>"] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]` */
 async function cmdAgent(args: string[]): Promise<number> {
   const parsed = parseArgs(args, [
     '--system',
     '--max-steps',
     '--cwd',
+    '--verify-cmd',
     '--exec-policy',
     '--context-budget',
     '--keep-recent',
@@ -616,10 +650,19 @@ async function cmdAgent(args: string[]): Promise<number> {
   const options: RunAgentOptions = {
     llm: recorder.llm,
     tools: createCoreTools({ policy: policyResult.policy }),
-    messages: createMessages(task, system),
+    messages: createMessages(task, system ?? AGENT_SYSTEM_PROMPT),
   }
   const effectiveMaxSteps = maxSteps ?? config?.maxSteps
   if (effectiveMaxSteps !== undefined) options.maxSteps = effectiveMaxSteps
+
+  // Steer a plain agent run too, not just `improve`. Without this, a run that
+  // gets stuck repeating the same check spends the entire budget before hitting
+  // maxSteps — one observed run burned 26 CPU-minutes looping. The decorator
+  // nudges at 60% of the budget and warns hard at 85%.
+  if (effectiveMaxSteps !== undefined && effectiveMaxSteps > 0) {
+    const steered = createSteeringLlmClient(recorder.llm, { maxSteps: effectiveMaxSteps })
+    options.llm = steered.client
+  }
   if (cwd !== undefined) options.cwd = cwd
   if (config?.model !== undefined) options.model = config.model
   const contextBudget = contextBudgetFrom(parsed, config)
@@ -639,12 +682,37 @@ async function cmdAgent(args: string[]): Promise<number> {
     process.stderr.write(`${formatContextLine(result.context)}\n`)
   }
 
+  // Optional verification gate. `improve` has a mandatory one; a plain agent run
+  // had none, so a phase could report success without ever running the checks it
+  // was given — a migration was written but never applied exactly this way. A red
+  // gate forces a non-zero exit: success is never claimed on red.
+  const verifyCmd = flagValue(parsed, '--verify-cmd')
+  let verify: { command: string; exitCode: number; tail: string } | null = null
+  if (verifyCmd !== undefined && result.ok) {
+    const run = spawnSync(verifyCmd, {
+      cwd: cwd ?? process.cwd(),
+      shell: true,
+      encoding: 'utf-8',
+    })
+    const exitCode = typeof run.status === 'number' ? run.status : 1
+    const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
+    verify = { command: verifyCmd, exitCode, tail: lastLines(output, 20) }
+    if (exitCode !== 0) {
+      logger.error(`verify gate FAILED (exit ${exitCode}): ${verifyCmd}`)
+      process.stderr.write(`${verify.tail}\n`)
+    } else {
+      process.stderr.write(`verify gate passed: ${verifyCmd}\n`)
+    }
+  }
+
+  const ok = result.ok && (verify === null || verify.exitCode === 0)
+
   persistUsage({
     kind: 'agent',
     model: config?.model ?? DEFAULT_MODEL,
     steps: result.steps,
     durationMs: Date.now() - startedAt,
-    ok: result.ok,
+    ok,
     label: task,
     recorder,
   })
@@ -653,10 +721,11 @@ async function cmdAgent(args: string[]): Promise<number> {
     console.log(
       JSON.stringify(
         {
-          ok: result.ok,
+          ok,
           final: result.final,
           steps: result.steps,
           error: result.error ?? null,
+          verify,
           // Last applied stats, or null when nothing was pruned.
           context: result.context ?? null,
         },
@@ -664,14 +733,15 @@ async function cmdAgent(args: string[]): Promise<number> {
         2,
       ),
     )
-  } else if (result.ok) {
+  } else if (ok) {
     console.log(result.final)
   } else {
     if (result.final.length > 0) console.log(result.final)
-    logger.error(result.error ?? 'agent run failed')
+    if (!result.ok) logger.error(result.error ?? 'agent run failed')
+    else logger.error('agent finished, but the verify gate failed')
   }
 
-  return result.ok ? 0 : 1
+  return ok ? 0 : 1
 }
 
 /** `zoocode chat [--mock] [--system <text>] [--context-budget <tokens>] [--keep-recent <n>] [--exec-policy <mode>]` */
@@ -1297,7 +1367,7 @@ const USAGE = `
 
   Usage:
     zoocode tools [--json]
-    zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>] [--allow-exec] [--no-exec]
+    zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--verify-cmd "<cmd>"] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>] [--allow-exec] [--no-exec]
     zoocode chat [--mock] [--system <text>] [--context-budget <tokens>] [--keep-recent <n>] [--exec-policy <mode>] [--allow-exec] [--no-exec]
     zoocode run <file.json | -> [--concurrency N] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--exec-policy <mode>] [--allow-exec] [--no-exec]
     zoocode doctor [--json]

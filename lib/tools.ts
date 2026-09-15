@@ -187,6 +187,106 @@ function writeFileTool(): ToolDef {
   }
 }
 
+/**
+ * Exact-string edit — the tool this harness was missing.
+ *
+ * Without it the only way to change one line was `write_file`, i.e. regenerate
+ * the ENTIRE file. That is how a 900-line file came back truncated and lost the
+ * tail of a switch statement, and how an oversized response killed a run with
+ * "response body was not valid JSON". A search/replace block keeps the model's
+ * output proportional to the size of the change, which is the actual fix.
+ *
+ * Refusal semantics matter as much as the happy path:
+ *   - no match      → refuse with guidance (never silently write nothing)
+ *   - several matches → refuse as ambiguous unless `all` is set, because
+ *     silently editing the first of many is how the wrong site gets changed
+ *   - CRLF files    → say so explicitly, since a search copied from a model
+ *     that thinks in LF will otherwise never match on Windows
+ */
+function editFileTool(): ToolDef {
+  return {
+    name: 'edit_file',
+    description:
+      'Edit an existing file by replacing one exact block of text. PREFER THIS OVER write_file for any change to a file that already exists: it only sends the changed part, so the rest of the file cannot be truncated. The "search" text must match the file byte-for-byte, indentation included. Refuses if the text is not found, or if it appears more than once unless "all" is true.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the file to edit (relative or absolute).' },
+        search: {
+          type: 'string',
+          description:
+            'Exact text to find, copied verbatim from the file including indentation and line breaks.',
+        },
+        replace: {
+          type: 'string',
+          description: 'Text to replace it with. Use an empty string to delete the matched text.',
+        },
+        all: {
+          type: 'boolean',
+          description: 'Replace every occurrence instead of requiring the match to be unique.',
+        },
+      },
+      required: ['path', 'search', 'replace'],
+    },
+    handler: async (args, ctx) => {
+      const path = stringArg(args, 'path')
+      if (!path) return fail('edit_file requires a "path" string')
+      if (typeof args.search !== 'string' || args.search.length === 0) {
+        return fail('edit_file requires a non-empty "search" string')
+      }
+      if (typeof args.replace !== 'string') return fail('edit_file requires a "replace" string')
+      const full = resolvePath(path, ctx.cwd)
+
+      if (!existsSync(full)) {
+        return fail(`File does not exist: ${path}. Use write_file to create a new file.`)
+      }
+
+      let before: string
+      try {
+        before = readTextFile(full)
+      } catch (err) {
+        return fail(`Failed to read ${path}: ${errorMessage(err)}`)
+      }
+
+      const search = args.search
+      // split/join rather than String.replace: the replacement text may contain
+      // "$&"-style sequences, which replace() would treat as backreferences.
+      const occurrences = before.split(search).length - 1
+
+      if (occurrences === 0) {
+        if (before.includes('\r\n') && !search.includes('\r\n')) {
+          return fail(
+            `The "search" text was not found in ${path}. This file uses CRLF line endings, so the search text must contain them too — read the file and copy the exact bytes.`,
+          )
+        }
+        return fail(
+          `The "search" text was not found in ${path}. Read the file and copy the exact text, indentation and line breaks included.`,
+        )
+      }
+
+      const replaceAll = args.all === true
+      if (occurrences > 1 && !replaceAll) {
+        return fail(
+          `The "search" text appears ${occurrences} times in ${path}, so the edit is ambiguous. Include more surrounding text to make it unique, or pass "all": true to replace every occurrence.`,
+        )
+      }
+
+      const after = before.split(search).join(args.replace)
+      try {
+        writeTextFile(full, after)
+      } catch (err) {
+        return fail(`Failed to write ${path}: ${errorMessage(err)}`)
+      }
+
+      const replaced = replaceAll ? occurrences : 1
+      return {
+        ok: true,
+        content: `Edited ${path}: replaced ${replaced} occurrence${replaced === 1 ? '' : 's'}.`,
+      }
+    },
+  }
+}
+
 function listFilesTool(): ToolDef {
   return {
     name: 'list_files',
@@ -455,6 +555,7 @@ export function createCoreTools(options: CoreToolOptions = {}): ToolDef[] {
   return [
     readFileTool(),
     writeFileTool(),
+    editFileTool(),
     listFilesTool(),
     searchFilesTool(),
     runCommandTool(allowExec, policy),
