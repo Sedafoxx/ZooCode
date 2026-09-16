@@ -19,6 +19,7 @@
 
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import { DEFAULT_MODEL, loadConfig, type ZooConfig } from '../lib/config.js'
@@ -34,6 +35,18 @@ import {
   createSteeringLlmClient,
 } from '../lib/improve.js'
 import { formatEnvironment, probeEnvironment, summariseEnvironment } from '../lib/environment.js'
+import {
+  formatRepoFacts,
+  isProbableRepo,
+  probeRepo,
+  summariseRepoFacts,
+} from '../lib/repo-context.js'
+import {
+  createFixtureStore,
+  formatFixtureNotice,
+  FIXTURE_FILE_REL,
+  type FixtureMode,
+} from '../lib/fixtures.js'
 import { describeVerify, formatBaseline, summariseVerify, type VerifySummary } from '../lib/verify.js'
 import { createDeepSeekClient, createMockLlmClient } from '../lib/llm.js'
 import * as logger from '../lib/logger.js'
@@ -624,7 +637,12 @@ function runVerifyCommand(command: string, cwd: string): VerifySummary {
   return summariseVerify(command, exitCode, `${run.stdout ?? ''}${run.stderr ?? ''}`)
 }
 
-/** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--verify-cmd "<cmd>"] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]` */
+/** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--verify-cmd "<cmd>"] [--context-budget <tokens>] [--keep-recent <n>] [--no-repo-facts] [--record-fixtures] [--replay-fixtures] [--fixtures-file <path>] [--mock] [--json] [--events] [--exec-policy <mode>]`
+
+ * A run is told three things it would otherwise spend steps discovering: the
+ * environment it is running in, probed facts about the repository, and — when a
+ * verify command is given — the verification's verdict BEFORE the run starts, so
+ * a pre-existing failure is not mistaken for one it caused. */
 async function cmdAgent(args: string[]): Promise<number> {
   const parsed = parseArgs(args, [
     '--system',
@@ -634,17 +652,21 @@ async function cmdAgent(args: string[]): Promise<number> {
     '--exec-policy',
     '--context-budget',
     '--keep-recent',
+    '--fixtures-file',
   ])
   const task = parsed.positionals[0]
   if (task === undefined) {
     logger.error('agent requires a task prompt')
-    logger.dim('usage: zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]')
+    logger.dim('usage: zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--verify-cmd "<cmd>"] [--no-repo-facts] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]')
     return 1
   }
 
   const mock = flagEnabled(parsed, '--mock')
   const asJson = flagEnabled(parsed, '--json')
   const streamEvents = flagEnabled(parsed, '--events')
+  const noRepoFacts = flagEnabled(parsed, '--no-repo-facts')
+  const recordFixtures = flagEnabled(parsed, '--record-fixtures')
+  const replayFixtures = flagEnabled(parsed, '--replay-fixtures')
   const system = flagValue(parsed, '--system')
   const cwd = flagValue(parsed, '--cwd')
   const maxSteps = flagNumber(parsed, '--max-steps')
@@ -669,18 +691,49 @@ async function cmdAgent(args: string[]): Promise<number> {
   const verifyCwd = cwd ?? process.cwd()
   const environment = probeEnvironment(verifyCwd)
   const baseline = verifyCmd !== undefined ? runVerifyCommand(verifyCmd, verifyCwd) : null
+
+  // Probed facts about the repository, so a run does not spend its opening steps
+  // re-reading package.json, listing files and reading a migration to learn what
+  // the harness can compute itself. Suppressed by --no-repo-facts, and skipped
+  // when the caller supplied an explicit --system prompt, which is a deliberate
+  // contract that extra context should not quietly join.
+  const repoFacts =
+    noRepoFacts || !isProbableRepo(verifyCwd) ? null : probeRepo(verifyCwd)
+
   if (baseline !== null) {
     process.stderr.write(`${summariseEnvironment(environment)} · ${describeVerify(baseline)}\n`)
     if (baseline.exitCode !== 0) process.stderr.write(`${lastLines(baseline.tail, 5)}\n`)
   }
+  if (repoFacts !== null) process.stderr.write(`${summariseRepoFacts(repoFacts)}\n`)
+
+  // Fixture recording/replay. Replay makes the expensive part of a loop — the
+  // command that actually takes time and money — instant and deterministic, so a
+  // one-line change can be tested repeatedly without re-paying for the pipeline.
+  if (recordFixtures && replayFixtures) {
+    logger.error('--record-fixtures and --replay-fixtures are mutually exclusive')
+    return 1
+  }
+  const fixtureMode: FixtureMode = recordFixtures ? 'record' : replayFixtures ? 'replay' : 'off'
+  const fixtures =
+    fixtureMode === 'off'
+      ? undefined
+      : createFixtureStore({
+          mode: fixtureMode,
+          file: flagValue(parsed, '--fixtures-file') ?? join(verifyCwd, FIXTURE_FILE_REL),
+        })
+  if (fixtures !== undefined) {
+    process.stderr.write(`fixtures ${fixtures.mode}: ${fixtures.file}\n`)
+  }
 
   const systemParts = [system ?? AGENT_SYSTEM_PROMPT, formatEnvironment(environment)]
+  if (repoFacts !== null && system === undefined) systemParts.push(formatRepoFacts(repoFacts))
+  if (fixtures !== undefined) systemParts.push(formatFixtureNotice(fixtures.mode, fixtures.file))
   if (baseline !== null) systemParts.push(formatBaseline(baseline))
 
   const options: RunAgentOptions = {
     llm: recorder.llm,
-    tools: createCoreTools({ policy: policyResult.policy }),
-    messages: createMessages(task, systemParts.join('\n\n')),
+    tools: createCoreTools({ policy: policyResult.policy, fixtures }),
+    messages: createMessages(task, systemParts.filter((part) => part.length > 0).join('\n\n')),
   }
   const effectiveMaxSteps = maxSteps ?? config?.maxSteps
   if (effectiveMaxSteps !== undefined) options.maxSteps = effectiveMaxSteps
@@ -718,6 +771,14 @@ async function cmdAgent(args: string[]): Promise<number> {
   // JSON payload on stdout stays clean.
   if (result.context !== undefined) {
     process.stderr.write(`${formatContextLine(result.context)}\n`)
+  }
+
+  if (fixtures !== undefined) {
+    const s = fixtures.stats()
+    process.stderr.write(
+      `fixtures ${s.mode}: ${s.hits} replayed, ${s.misses} miss(es), ${s.recorded} recorded this run, ${s.total} stored\n`,
+    )
+    fixtures.flush()
   }
 
   // Optional verification gate. `improve` has a mandatory one; a plain agent run
@@ -758,6 +819,8 @@ async function cmdAgent(args: string[]): Promise<number> {
           verify,
           baseline,
           environment: summariseEnvironment(environment),
+          repoFacts: repoFacts === null ? null : summariseRepoFacts(repoFacts),
+          fixtures: fixtures === undefined ? null : fixtures.stats(),
           // Last applied stats, or null when nothing was pruned.
           context: result.context ?? null,
         },

@@ -27,6 +27,8 @@ import { createExecPolicy, evaluateCommand, type ExecPolicy } from './policy.js'
 const MAX_READ_CHARS = 40_000
 const MAX_OUTPUT_CHARS = 20_000
 const MAX_LIST_ENTRIES = 500
+import { fixtureKey, type FixtureStore } from './fixtures.js'
+
 const DEFAULT_TIMEOUT_MS = 30_000
 
 /** Directories never worth listing for an agent. */
@@ -417,7 +419,18 @@ function searchFilesTool(): ToolDef {
   }
 }
 
-function runCommandTool(allowExec: boolean, policy: ExecPolicy): ToolDef {
+/** The numeric exit code behind a ToolResult, for faithful fixture recording. */
+function exitCodeOf(result: ToolResult): number {
+  if (result.ok) return 0
+  const match = /exit code (\d+)/.exec(result.error ?? '')
+  return match ? Number(match[1]) : 1
+}
+
+function runCommandTool(
+  allowExec: boolean,
+  policy: ExecPolicy,
+  fixtures?: FixtureStore,
+): ToolDef {
   return {
     name: 'run_command',
     description:
@@ -457,7 +470,40 @@ function runCommandTool(allowExec: boolean, policy: ExecPolicy): ToolDef {
       const timeoutMs =
         typeof args.timeoutMs === 'number' && args.timeoutMs > 0 ? args.timeoutMs : DEFAULT_TIMEOUT_MS
 
-      return runShell(command, cwd, timeoutMs, ctx.signal)
+      // Replay is a hard seam: it NEVER falls through to a real run. A replay that
+      // quietly executed the command (or quietly returned nothing) would let an
+      // agent believe it had verified something it had not, which is worse than
+      // having no replay at all. A miss is therefore a loud failure.
+      if (fixtures && fixtures.mode === 'replay') {
+        const hit = fixtures.lookup(command)
+        if (!hit) {
+          return {
+            ok: false,
+            error: 'Replay miss',
+            content:
+              `Replay miss: no recorded output for \`${fixtureKey(command)}\`. The shell is ` +
+              'simulated in replay mode, so this command did NOT run. Either record it first ' +
+              'with --record-fixtures, or use a command that was recorded. Do not invent its output.',
+          }
+        }
+        return hit.error !== undefined
+          ? { ok: hit.ok, error: hit.error, content: hit.content }
+          : { ok: hit.ok, content: hit.content }
+      }
+
+      const result = await runShell(command, cwd, timeoutMs, ctx.signal)
+
+      if (fixtures && fixtures.mode === 'record') {
+        fixtures.record({
+          command,
+          ok: result.ok,
+          exitCode: exitCodeOf(result),
+          content: result.content,
+          ...(result.error !== undefined ? { error: result.error } : {}),
+        })
+      }
+
+      return result
     },
   }
 }
@@ -560,6 +606,11 @@ export interface CoreToolOptions {
    * `allowlist`.
    */
   policy?: ExecPolicy
+  /**
+   * Record or replay `run_command` output (see [`lib/fixtures.ts`](./fixtures.ts)).
+   * Omitted means commands always execute, which is the historical behaviour.
+   */
+  fixtures?: FixtureStore
 }
 
 /**
@@ -577,7 +628,7 @@ export function createCoreTools(options: CoreToolOptions = {}): ToolDef[] {
     editFileTool(),
     listFilesTool(),
     searchFilesTool(),
-    runCommandTool(allowExec, policy),
+    runCommandTool(allowExec, policy, options.fixtures),
     zooDoctorTool(),
     zooNotesTool(),
     finishTool(),
