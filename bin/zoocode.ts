@@ -33,6 +33,8 @@ import {
   runImprovement,
   createSteeringLlmClient,
 } from '../lib/improve.js'
+import { formatEnvironment, probeEnvironment, summariseEnvironment } from '../lib/environment.js'
+import { describeVerify, formatBaseline, summariseVerify, type VerifySummary } from '../lib/verify.js'
 import { createDeepSeekClient, createMockLlmClient } from '../lib/llm.js'
 import * as logger from '../lib/logger.js'
 import { searchProjects, type SearchOptions } from '../lib/search.js'
@@ -610,6 +612,18 @@ function lastLines(output: string, count: number): string {
   return lines.slice(Math.max(0, lines.length - count)).join('\n')
 }
 
+/**
+ * Run the verification command once and return a STRUCTURED verdict rather than a
+ * wall of text. Used twice: as the pre-flight baseline before the agent starts,
+ * and as the gate after it finishes. Both callers want the same two facts — the
+ * exit code and the names of the checks that failed.
+ */
+function runVerifyCommand(command: string, cwd: string): VerifySummary {
+  const run = spawnSync(command, { cwd, shell: true, encoding: 'utf-8' })
+  const exitCode = typeof run.status === 'number' ? run.status : 1
+  return summariseVerify(command, exitCode, `${run.stdout ?? ''}${run.stderr ?? ''}`)
+}
+
 /** `zoocode agent "<task>" [--system <text>] [--max-steps N] [--cwd <path>] [--verify-cmd "<cmd>"] [--context-budget <tokens>] [--keep-recent <n>] [--mock] [--json] [--events] [--exec-policy <mode>]` */
 async function cmdAgent(args: string[]): Promise<number> {
   const parsed = parseArgs(args, [
@@ -647,10 +661,26 @@ async function cmdAgent(args: string[]): Promise<number> {
   const { llm, config } = resolved.session
   const recorder = withUsageRecording(llm)
 
+  // The verify command is resolved up front now, because it is not only a gate at
+  // the end — it is also a BASELINE before the run begins. Knowing what already
+  // fails is what stops an agent chasing a pre-existing failure, and knowing what
+  // already passes is what makes "I did not break it" checkable afterwards.
+  const verifyCmd = flagValue(parsed, '--verify-cmd')
+  const verifyCwd = cwd ?? process.cwd()
+  const environment = probeEnvironment(verifyCwd)
+  const baseline = verifyCmd !== undefined ? runVerifyCommand(verifyCmd, verifyCwd) : null
+  if (baseline !== null) {
+    process.stderr.write(`${summariseEnvironment(environment)} · ${describeVerify(baseline)}\n`)
+    if (baseline.exitCode !== 0) process.stderr.write(`${lastLines(baseline.tail, 5)}\n`)
+  }
+
+  const systemParts = [system ?? AGENT_SYSTEM_PROMPT, formatEnvironment(environment)]
+  if (baseline !== null) systemParts.push(formatBaseline(baseline))
+
   const options: RunAgentOptions = {
     llm: recorder.llm,
     tools: createCoreTools({ policy: policyResult.policy }),
-    messages: createMessages(task, system ?? AGENT_SYSTEM_PROMPT),
+    messages: createMessages(task, systemParts.join('\n\n')),
   }
   const effectiveMaxSteps = maxSteps ?? config?.maxSteps
   if (effectiveMaxSteps !== undefined) options.maxSteps = effectiveMaxSteps
@@ -660,7 +690,15 @@ async function cmdAgent(args: string[]): Promise<number> {
   // maxSteps — one observed run burned 26 CPU-minutes looping. The decorator
   // nudges at 60% of the budget and warns hard at 85%.
   if (effectiveMaxSteps !== undefined && effectiveMaxSteps > 0) {
-    const steered = createSteeringLlmClient(recorder.llm, { maxSteps: effectiveMaxSteps })
+    // With a verify command there is a concrete thing to spend the last steps on,
+    // so a slice of the budget is reserved for it (~15%, at least 4 steps). Two
+    // observed runs hit the cap with their verification never run.
+    const reserve =
+      verifyCmd !== undefined ? Math.max(4, Math.ceil(effectiveMaxSteps * 0.15)) : 0
+    const steered = createSteeringLlmClient(recorder.llm, {
+      maxSteps: effectiveMaxSteps,
+      reserve,
+    })
     options.llm = steered.client
   }
   if (cwd !== undefined) options.cwd = cwd
@@ -686,22 +724,14 @@ async function cmdAgent(args: string[]): Promise<number> {
   // had none, so a phase could report success without ever running the checks it
   // was given — a migration was written but never applied exactly this way. A red
   // gate forces a non-zero exit: success is never claimed on red.
-  const verifyCmd = flagValue(parsed, '--verify-cmd')
-  let verify: { command: string; exitCode: number; tail: string } | null = null
+  let verify: VerifySummary | null = null
   if (verifyCmd !== undefined && result.ok) {
-    const run = spawnSync(verifyCmd, {
-      cwd: cwd ?? process.cwd(),
-      shell: true,
-      encoding: 'utf-8',
-    })
-    const exitCode = typeof run.status === 'number' ? run.status : 1
-    const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
-    verify = { command: verifyCmd, exitCode, tail: lastLines(output, 20) }
-    if (exitCode !== 0) {
-      logger.error(`verify gate FAILED (exit ${exitCode}): ${verifyCmd}`)
+    verify = runVerifyCommand(verifyCmd, verifyCwd)
+    if (verify.exitCode !== 0) {
+      logger.error(`verify gate FAILED: ${describeVerify(verify)}`)
       process.stderr.write(`${verify.tail}\n`)
     } else {
-      process.stderr.write(`verify gate passed: ${verifyCmd}\n`)
+      process.stderr.write(`verify gate passed: ${describeVerify(verify)}\n`)
     }
   }
 
@@ -726,6 +756,8 @@ async function cmdAgent(args: string[]): Promise<number> {
           steps: result.steps,
           error: result.error ?? null,
           verify,
+          baseline,
+          environment: summariseEnvironment(environment),
           // Last applied stats, or null when nothing was pruned.
           context: result.context ?? null,
         },

@@ -465,6 +465,15 @@ export interface SteeringOptions {
   /** Fraction of the budget at which to nudge (default 0.6) and to warn hard (default 0.85). */
   nudgeAt?: number
   warnAt?: number
+  /**
+   * Steps kept free for verification. When the budget reaches
+   * `maxSteps - reserve`, one final reminder tells the model to stop
+   * investigating and spend what is left on running the checks or on handing
+   * back a precise state summary. Two observed runs died at the step cap with
+   * their verification never run at all: the most valuable step is the last one,
+   * so it is reserved rather than competed for.
+   */
+  reserve?: number
 }
 
 /** Default fraction of the budget at which the decorator nudges the model. */
@@ -508,6 +517,34 @@ function warnMessage(step: number, maxSteps: number): ChatMessage {
 }
 
 /**
+ * Final-tier reminder: the last `reserve` steps belong to verification.
+ *
+ * This is the tier that distinguishes "ran out of steps while useful" from "ran
+ * out of steps mid-investigation". It explicitly forbids starting anything new,
+ * because the observed failure mode is improvising another diagnostic probe
+ * instead of running the check that would settle the question.
+ */
+function reserveMessage(step: number, maxSteps: number, reserve: number): ChatMessage {
+  const remaining = Math.max(0, maxSteps - step + 1)
+  const unit = remaining === 1 ? 'step' : 'steps'
+  return {
+    role: 'user',
+    content:
+      `Step ${step} of ${maxSteps}: ${remaining} ${unit} left, and the last ${reserve} are RESERVED for verification. ` +
+      'Stop investigating and start nothing new. Either run the project\'s verification command now, or call ' +
+      '`finish` with a precise state summary: which files changed, what you ran, the exact result, and what ' +
+      'remains unverified. Do not claim success you have not measured.',
+  }
+}
+
+/** A usable reserve: a positive integer, or 0 when absent/invalid. */
+function steerReserve(value: unknown, maxSteps: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
+  // Never reserve the whole budget, or the first tier would fire on step 1.
+  return Math.min(Math.floor(value), Math.max(0, maxSteps - 1))
+}
+
+/**
  * Wrap an `LlmClient` so the step budget is spent acting, not deliberating.
  *
  * Every `chat()` call is counted. Past {@link DEFAULT_STEERING_NUDGE_AT} of the
@@ -533,10 +570,15 @@ export function createSteeringLlmClient(
   const warnAt = steerFraction(options?.warnAt, DEFAULT_STEERING_WARN_AT)
   const nudgeStep = active ? steerStep(maxSteps as number, nudgeAt) : Number.POSITIVE_INFINITY
   const warnStep = active ? steerStep(maxSteps as number, warnAt) : Number.POSITIVE_INFINITY
+  const reserve = active ? steerReserve(options?.reserve, maxSteps as number) : 0
+  const reserveStep =
+    active && reserve > 0
+      ? Math.max(1, (maxSteps as number) - reserve)
+      : Number.POSITIVE_INFINITY
 
   let steps = 0
   let injected = 0
-  let highestTier = 0 // 0 = none, 1 = nudge, 2 = warn
+  let highestTier = 0 // 0 = none, 1 = nudge, 2 = warn, 3 = reserve
 
   const client: LlmClient = {
     async chat(req: LlmRequest): Promise<LlmResponse> {
@@ -544,7 +586,11 @@ export function createSteeringLlmClient(
       if (!active || !req || typeof req !== 'object') return inner.chat(req)
 
       let steering: ChatMessage | undefined
-      if (highestTier < 2 && steps >= warnStep) {
+      if (highestTier < 3 && steps >= reserveStep) {
+        steering = reserveMessage(steps, maxSteps as number, reserve)
+        highestTier = 3
+        injected += 1
+      } else if (highestTier < 2 && steps >= warnStep) {
         steering = warnMessage(steps, maxSteps as number)
         highestTier = 2
         injected += 1

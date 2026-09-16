@@ -61,6 +61,25 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max)}\n[truncated]`
 }
 
+/**
+ * Truncate long COMMAND output, keeping the head AND the tail.
+ *
+ * Head-only truncation is what made a real run conclude "output capture is empty
+ * even for simple commands" and start writing its output to a file to read back.
+ * The truth was narrower and worse: a test script printed its whole setup first
+ * and its PASS/FAIL verdict last, so only the setup reached the model and the
+ * verdict was discarded. The end of a command's output is where its meaning
+ * lives, so it survives truncation now. Exported because the boundary between
+ * "you can see the verdict" and "you cannot" is worth a test.
+ */
+export function truncateCommandOutput(text: string, max: number): string {
+  if (text.length <= max) return text
+  const head = Math.floor(max * 0.4)
+  const tail = max - head
+  const elided = text.length - max
+  return `${text.slice(0, head)}\n…[truncated ${elided} characters from the middle]…\n${text.slice(-tail)}`
+}
+
 /** Resolve `input` against `cwd` when it is not already absolute. */
 function resolvePath(input: string, cwd: string): string {
   return isAbsolute(input) ? input : resolve(cwd, input)
@@ -110,7 +129,7 @@ function runShell(
       (err, stdout, stderr) => {
         const output = combineOutput(stdout, stderr)
         if (!err) {
-          resolvePromise({ ok: true, content: truncate(output || '(no output)', MAX_OUTPUT_CHARS) })
+          resolvePromise({ ok: true, content: truncateCommandOutput(output || '(no output)', MAX_OUTPUT_CHARS) })
           return
         }
         const code = (err as { code?: unknown }).code
@@ -118,7 +137,7 @@ function runShell(
           resolvePromise({
             ok: false,
             error: `exit code ${code}`,
-            content: truncate(output || `exit code ${code}`, MAX_OUTPUT_CHARS),
+            content: truncateCommandOutput(output || `exit code ${code}`, MAX_OUTPUT_CHARS),
           })
           return
         }
@@ -126,7 +145,7 @@ function runShell(
         resolvePromise({
           ok: false,
           error: message,
-          content: truncate(output ? `${output}\n${message}` : message, MAX_OUTPUT_CHARS),
+          content: truncateCommandOutput(output ? `${output}\n${message}` : message, MAX_OUTPUT_CHARS),
         })
       },
     )

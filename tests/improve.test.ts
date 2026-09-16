@@ -550,7 +550,7 @@ describe('defaultImproveSystemPrompt', () => {
 async function driveSteering(
   maxSteps: number | undefined,
   steps: number,
-  options?: { nudgeAt?: number; warnAt?: number },
+  options?: { nudgeAt?: number; warnAt?: number; reserve?: number },
 ): Promise<{ requests: LlmRequest[]; injected: () => number; base: ChatMessage[] }> {
   const requests: LlmRequest[] = []
   const inner: LlmClient = {
@@ -614,6 +614,35 @@ describe('createSteeringLlmClient', () => {
     expect(reminders.filter((content) => content.includes('Stop exploring'))).toHaveLength(1)
     expect(reminders.filter((content) => content.includes('IMMEDIATELY'))).toHaveLength(1)
     expect(injected()).toBe(2)
+  })
+
+  it('(c1) reserves the last steps for verification when asked', async () => {
+    // maxSteps 10 with reserve 4: step 6 would have been the ordinary nudge, but
+    // the reserve tier outranks it and is the only reminder injected, so the run
+    // is not nagged back into investigating.
+    const { requests, injected } = await driveSteering(10, 10, { reserve: 4 })
+
+    expect(steeringOf(requests[4])).toBeUndefined()
+    const reserved = steeringOf(requests[5])
+    expect(reserved).toBeDefined()
+    expect(reserved ?? '').toContain('Step 6 of 10')
+    expect(reserved ?? '').toContain('RESERVED for verification')
+    expect(reserved ?? '').toContain('start nothing new')
+    expect(reserved ?? '').toContain('Do not claim success you have not measured')
+    expect(steeringOf(requests[6])).toBeUndefined()
+    expect(steeringOf(requests[8])).toBeUndefined()
+    expect(injected()).toBe(1)
+  })
+
+  it('(c2) never reserves more steps than the budget has', async () => {
+    const { requests } = await driveSteering(10, 10, { reserve: 50 })
+    expect(steeringOf(requests[0]) ?? '').toContain('last 9 are RESERVED')
+  })
+
+  it('(c3) is inert without a budget to reserve from', async () => {
+    const { requests, injected } = await driveSteering(undefined, 20, { reserve: 4 })
+    expect(requests.every((req) => steeringOf(req) === undefined)).toBe(true)
+    expect(injected()).toBe(0)
   })
 
   it('(d) is inert when maxSteps is undefined or <= 0', async () => {
